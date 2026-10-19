@@ -47,9 +47,9 @@ Thumbs.db
 coverage.xml
 htmlcov/
 
-# phone transport dirs — do not commit
-.claude/inbox
-.claude/outbox
+# local agent + phone-remote state (inbox/outbox, skills, repo-health) — do not commit
+.claude/
+.waterplane/
 .outbox
 
 # local agent instructions — do not commit
