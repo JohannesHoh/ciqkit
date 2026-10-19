@@ -3,6 +3,8 @@
 All fixtures: AppleScript output and the app console are fed in as text/files,
 and the session's GUI calls are replaced, so no simulator, GUI or macOS is needed.
 """
+import os
+
 import pytest
 
 from ciqkit.capture import screenshot_utils as su
@@ -140,7 +142,8 @@ def test_act_fit_returns_a_failure_instead_of_raising(monkeypatch):
 def test_load_chunk_carries_the_fit_file_and_the_broker_forwards_it(tmp_path):
     c = jobs.load_chunk(device="venu3", project=str(tmp_path), prg="bin/a.prg",
                         fit="~/r/a.fit")
-    assert c.args["fit"].endswith("/r/a.fit") and c.args["fit"].startswith("/")
+    assert c.args["fit"] == os.path.abspath(os.path.expanduser("~/r/a.fit"))
+    assert os.path.isabs(c.args["fit"]) and "~" not in c.args["fit"]
     assert "fit" not in jobs.load_chunk(device="venu3", project=str(tmp_path)).args
 
     seen = {}
