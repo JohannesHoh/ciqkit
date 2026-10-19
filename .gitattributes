@@ -1,0 +1,7 @@
+# Templates are copied byte-for-byte into new projects, and the example is
+# their reference copy (tests/test_wp6_new_init.py). A CRLF checkout on Windows
+# made the two differ, and mixed line endings into generated manifests, whose
+# product list the scaffold writes with "\n". Keep both LF on every platform;
+# text=auto leaves the PNGs alone.
+src/ciqkit/templates/** text=auto eol=lf
+examples/** text=auto eol=lf

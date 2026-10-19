@@ -1,0 +1,874 @@
+[
+  {
+    "id": "gotcha-001",
+    "title": "No typed arrays in Monkey C",
+    "api": "Language",
+    "tags": [
+      "arrays",
+      "type-system",
+      "compiler"
+    ],
+    "severity": "medium",
+    "wrong": "Trying to suppress 'Cannot determine if container access is using container type' warnings by casting array access with 'as Type'.",
+    "correct": "Accept that Monkey C arrays are Array<Object>. Container access warnings are expected and not errors.",
+    "codeWrong": "var val = arr[i] as Number;  // Creates worse errors",
+    "codeCorrect": "var val = arr[i];  // Accept the warning",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-002",
+    "title": "Sensor callback type annotation is required",
+    "api": "Sensor",
+    "tags": [
+      "callbacks",
+      "sensor",
+      "type-system"
+    ],
+    "severity": "critical",
+    "wrong": "Registering a sensor listener callback without exact type annotation: function onSensorData(info) { ... }",
+    "correct": "Use exact signature: function onSensorData(info as Sensor.SensorData) as Void { ... }",
+    "codeWrong": "Sensor.registerSensorDataListener(method(:onSensorData), options);\nfunction onSensorData(info) { ... }",
+    "codeCorrect": "Sensor.registerSensorDataListener(method(:onSensorData), options);\nfunction onSensorData(info as Sensor.SensorData) as Void { ... }",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-003",
+    "title": "Accelerometer data field is .accelerometerData not .accel",
+    "api": "Sensor",
+    "tags": [
+      "accelerometer",
+      "sensor",
+      "field-names"
+    ],
+    "severity": "critical",
+    "wrong": "Using info.accel to access accelerometer data from registerSensorDataListener callback.",
+    "correct": "Use info.accelerometerData which returns AccelerometerData with .x, .y, .z arrays in milli-g. The .accel field only exists on Sensor.Info from getInfo(), not on SensorData.",
+    "codeWrong": "var accel = sensorData.accel;  // Does not exist on SensorData",
+    "codeCorrect": "var accel = sensorData.accelerometerData;  // AccelerometerData with .x, .y, .z",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-004",
+    "title": "Steps and respiration not in sensor callback",
+    "api": "Sensor",
+    "tags": [
+      "sensor",
+      "callbacks",
+      "polling"
+    ],
+    "severity": "high",
+    "wrong": "Trying to get steps and respiration data from registerSensorDataListener callback.",
+    "correct": "Poll steps via ActivityMonitor.getInfo().steps and respiration via Sensor.getInfo().respirationRate separately.",
+    "codeWrong": "function onSensorData(info as Sensor.SensorData) as Void {\n  var steps = info.steps;  // Not available\n}",
+    "codeCorrect": "function pollNonStreamingSensors() {\n  var steps = ActivityMonitor.getInfo().steps;\n  var rr = Sensor.getInfo().respirationRate;\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-005",
+    "title": "Sensor listener options: only :period and :accelerometer",
+    "api": "Sensor",
+    "tags": [
+      "sensor",
+      "options",
+      "api"
+    ],
+    "severity": "high",
+    "wrong": "Passing additional options like :heartRate or other keys to registerSensorDataListener options dictionary.",
+    "correct": "Only valid keys are :period and :accelerometer (with :enabled and :sampleRate sub-keys). HR comes through SensorData.heartRate automatically.",
+    "codeWrong": "var options = { :period => 1, :heartRate => true };",
+    "codeCorrect": "var options = {\n  :period => 1,\n  :accelerometer => { :enabled => true, :sampleRate => 25 }\n};",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-006",
+    "title": "HR callback unreliable — poll Sensor.getInfo() instead",
+    "api": "Sensor",
+    "tags": [
+      "sensor",
+      "hr",
+      "polling",
+      "reliability"
+    ],
+    "severity": "high",
+    "wrong": "Relying solely on SensorData.heartRate from registerSensorDataListener callback for heart rate.",
+    "correct": "SensorData.heartRate may be null on some devices/firmware even when HR sensor is active. Use Sensor.getInfo().heartRate as primary HR source via polling.",
+    "codeWrong": "function onSensorData(info as Sensor.SensorData) as Void {\n  var hr = info.heartRate;  // May be null!\n}",
+    "codeCorrect": "// Use polling as primary HR source\nvar hr = Sensor.getInfo().heartRate;",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-007",
+    "title": "Lap field stamping order: setData BEFORE addLap",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "laps",
+      "recording"
+    ],
+    "severity": "critical",
+    "wrong": "Setting lap-level FIT field data after calling addLap().",
+    "correct": "Set ALL lap field values via setData() BEFORE calling addLap(). The current field value at lap-time is stamped into the FIT lap record.",
+    "codeWrong": "session.addLap();\nlapField.setData(duration);  // Too late!",
+    "codeCorrect": "lapField.setData(duration);\nsession.addLap();  // Now duration is stamped correctly",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-008",
+    "title": "Sport type affects Garmin Connect display",
+    "api": "Activity",
+    "tags": [
+      "fit",
+      "sport-types",
+      "garmin-connect"
+    ],
+    "severity": "high",
+    "wrong": "Using SPORT_ROCK_CLIMBING/SUB_SPORT_BOULDERING or SPORT_GENERIC which cause misleading displays in Garmin Connect.",
+    "correct": "Use SPORT_TRAINING/SUB_SPORT_CARDIO_TRAINING for HR-focused activities. This shows no misleading routes or distance. Developer fields provide authoritative stats.",
+    "codeWrong": "sport => Activity.SPORT_ROCK_CLIMBING,\nsubSport => Activity.SUB_SPORT_BOULDERING",
+    "codeCorrect": "sport => Activity.SPORT_TRAINING,\nsubSport => Activity.SUB_SPORT_CARDIO_TRAINING",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-009",
+    "title": "Garmin Connect Routes uses FIT splits, not CIQ laps",
+    "api": "Activity",
+    "tags": [
+      "fit",
+      "garmin-connect",
+      "sport-types"
+    ],
+    "severity": "high",
+    "wrong": "Using SPORT_ROCK_CLIMBING expecting Garmin Connect to show route counts from addLap() calls.",
+    "correct": "Garmin Connect's 'Routes total' uses FIT split messages (mesg_num 312) created by firmware, not Connect IQ addLap(). CIQ has no addSplit() API.",
+    "codeWrong": "// Garmin Connect shows '1 Route' from firmware splits, not your laps",
+    "codeCorrect": "// Use SPORT_TRAINING and a developer field (e.g. 'attempt_count') for the authoritative count",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-010",
+    "title": "ConfirmationDelegate uses onResponse(), not onConfirm/onReject",
+    "api": "WatchUi",
+    "tags": [
+      "ui-delegates",
+      "confirmation"
+    ],
+    "severity": "critical",
+    "wrong": "Overriding onConfirm() or onReject() methods on WatchUi.ConfirmationDelegate.",
+    "correct": "Override onResponse(response) with WatchUi.CONFIRM_YES/CONFIRM_NO checks. The older onConfirm()/onReject() methods compile without errors but are NEVER called at runtime on SDK 4.x+.",
+    "codeWrong": "class MyDelegate extends WatchUi.ConfirmationDelegate {\n  function onConfirm() { ... }  // Never called!\n}",
+    "codeCorrect": "class MyDelegate extends WatchUi.ConfirmationDelegate {\n  function onResponse(response) as Lang.Boolean {\n    if (response == WatchUi.CONFIRM_YES) { ... }\n    return true;\n  }\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-011",
+    "title": "Never pushView inside ConfirmationDelegate.onResponse()",
+    "api": "WatchUi",
+    "tags": [
+      "ui-navigation",
+      "view-stack",
+      "delegates"
+    ],
+    "severity": "critical",
+    "wrong": "Calling WatchUi.pushView() inside ConfirmationDelegate.onResponse().",
+    "correct": "The Confirmation dialog auto-pops after onResponse() returns. Pushing a view inside the callback causes the auto-pop to remove the new view instead. Set a flag and push from View.onShow().",
+    "codeWrong": "function onResponse(response) as Lang.Boolean {\n  WatchUi.pushView(newView, delegate, transition);  // Breaks view stack!\n  return true;\n}",
+    "codeCorrect": "function onResponse(response) as Lang.Boolean {\n  _mainView.pendingViewPush = true;\n  return true;\n}\n// In main View.onShow():\nif (pendingViewPush) { WatchUi.pushView(...); }",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-012",
+    "title": "Memory allocation in sensor callbacks",
+    "api": "Sensor",
+    "tags": [
+      "memory",
+      "performance",
+      "sensor"
+    ],
+    "severity": "high",
+    "wrong": "Allocating new arrays per sensor callback tick.",
+    "correct": "Reuse existing buffers and zero-fill them. Connect IQ apps have limited heap (~124 KB).",
+    "codeWrong": "function onSensorData(info as Sensor.SensorData) as Void {\n  var buf = new Array[100];  // Allocates per tick!\n}",
+    "codeCorrect": "hidden var _buf = new [100];\nfunction onSensorData(info as Sensor.SensorData) as Void {\n  _resetBuffer();  // Reuse\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-013",
+    "title": "String concatenation requires .toString() on numbers",
+    "api": "Language",
+    "tags": [
+      "strings",
+      "type-system",
+      "formatting"
+    ],
+    "severity": "medium",
+    "wrong": "Concatenating numbers with strings without explicit conversion.",
+    "correct": "Call .toString() on numbers before + with strings.",
+    "codeWrong": "dc.drawText(100, 100, font, count + \" laps\", justify);",
+    "codeCorrect": "dc.drawText(100, 100, font, count.toString() + \" laps\", justify);",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-014",
+    "title": "Haptic feedback requires capability check",
+    "api": "Attention",
+    "tags": [
+      "haptics",
+      "feature-check",
+      "api-availability"
+    ],
+    "severity": "medium",
+    "wrong": "Calling Attention.vibrate() without checking if the device supports it.",
+    "correct": "Always guard with if (Attention has :vibrate) before calling.",
+    "codeWrong": "Attention.vibrate([new Attention.VibeProfile(50, 100)]);",
+    "codeCorrect": "if (Attention has :vibrate) {\n  Attention.vibrate([new Attention.VibeProfile(50, 100)]);\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-015",
+    "title": "Type annotations require Lang prefix for primitives",
+    "api": "Language",
+    "tags": [
+      "type-system",
+      "imports",
+      "annotations"
+    ],
+    "severity": "critical",
+    "wrong": "Using bare primitive type names: as Float, as Boolean, as Number",
+    "correct": "Use fully-qualified types: as Lang.Float, as Lang.Boolean, as Lang.Number. Requires 'using Toybox.Lang;' import.",
+    "codeWrong": "function getValue() as Number { ... }  // Cannot resolve",
+    "codeCorrect": "using Toybox.Lang;\nfunction getValue() as Lang.Number { ... }",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-016",
+    "title": "No Unicode emoji rendering on Garmin",
+    "api": "Graphics",
+    "tags": [
+      "graphics",
+      "unicode",
+      "rendering"
+    ],
+    "severity": "low",
+    "wrong": "Using Unicode emoji in drawText().",
+    "correct": "Draw shapes using Graphics API: fillCircle(), fillPolygon(), drawArc(). Connect IQ cannot render Unicode emoji.",
+    "codeWrong": "dc.drawText(100, 100, font, \"⛰ Summit\", justify);",
+    "codeCorrect": "dc.fillCircle(50, 50, 10);\ndc.drawText(100, 100, font, \"Summit\", justify);",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-017",
+    "title": "Round display safe zones (22%-78% margins)",
+    "api": "Graphics",
+    "tags": [
+      "graphics",
+      "layout",
+      "round-display"
+    ],
+    "severity": "medium",
+    "wrong": "Using hardcoded pixel coordinates or full-width layouts on round AMOLED displays.",
+    "correct": "Use percentage-based positioning with 22%-78% horizontal margins. Keep content within ~80% of diameter from centre.",
+    "codeWrong": "dc.drawText(0, 100, font, \"Text\", justify);  // Clipped on left",
+    "codeCorrect": "var w = dc.getWidth();\ndc.drawText(w * 28 / 100, 100, font, \"Text\", justify);",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-018",
+    "title": "Developer key format (RSA-4096 PKCS8 DER)",
+    "api": "Build",
+    "tags": [
+      "build",
+      "signing",
+      "key-generation"
+    ],
+    "severity": "medium",
+    "wrong": "Using wrong key format or expecting a Garmin tool for key generation.",
+    "correct": "Generate RSA-4096 PKCS8 DER format key. Garmin has no tool for this — use Python cryptography package or openssl.",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-019",
+    "title": "monkeydo test flag: /t on Windows, -t on macOS",
+    "api": "Build",
+    "tags": [
+      "build",
+      "testing",
+      "windows"
+    ],
+    "severity": "medium",
+    "wrong": "Using -t flag for unit test mode on Windows.",
+    "correct": "Use /t flag on Windows: monkeydo.bat app.prg venu3 /t",
+    "codeWrong": "monkeydo.bat Tests.prg venu3 -t",
+    "codeCorrect": "monkeydo.bat Tests.prg venu3 /t",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-020",
+    "title": "fitContributions resource mapping required",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "resources",
+      "garmin-connect"
+    ],
+    "severity": "medium",
+    "wrong": "Creating developer FIT fields in code without fit.xml entries.",
+    "correct": "Define fields in resources/fit/fit.xml with matching field IDs and displayInActivitySummary/displayInChart/displayInActivityLaps attributes.",
+    "codeWrong": "var field = session.createField(\"Custom\", 99, ...);  // No fit.xml entry",
+    "codeCorrect": "<fitContributions>\n  <fitContribution fieldId=\"99\" mesgId=\"0\" displayInActivitySummary=\"true\" />\n</fitContributions>",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-021",
+    "title": "Developer field nativeNum is broken",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "developer-fields",
+      "native-fields"
+    ],
+    "severity": "high",
+    "wrong": "Using nativeNum parameter in createField() to override native FIT fields.",
+    "correct": "Do NOT use nativeNum. It creates duplicate fields — one native (always 0) and one developer with your data. Garmin Connect reads the native one. Use the correct :sport type instead.",
+    "codeWrong": "session.createField(\"Distance\", id, type, { :nativeNum => 5 });",
+    "codeCorrect": "// Let firmware compute native metrics via correct SPORT type\nsession.createField(\"Custom Distance\", id, type, { :mesgType => MESG_TYPE_SESSION });",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-022",
+    "title": "Developer field count limit (~20 per session)",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "developer-fields",
+      "limits"
+    ],
+    "severity": "high",
+    "wrong": "Creating more than ~20 developer fields per FIT session.",
+    "correct": "Venu 3 has a practical limit of ~20 developer fields per session. Exceeding causes all session-level fields to silently fail. Trim diagnostic fields aggressively.",
+    "codeWrong": "// Creating 25+ fields — all session fields fail",
+    "codeCorrect": "// Keep <20 fields total\nif (field != null) {\n  try { field.setData(value); } catch (e) {}\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-023",
+    "title": "Wrap setData() calls individually in try-catch",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "error-handling",
+      "reliability"
+    ],
+    "severity": "high",
+    "wrong": "Setting multiple FIT field values without individual error handling.",
+    "correct": "Wrap each setData() call individually in try-catch. If one throws, it can abort the finalization and lose all session-level data.",
+    "codeWrong": "sessionField.setData(value1);\ntotalField.setData(value2);  // If this throws, all data lost",
+    "codeCorrect": "function _safeSetData(field, value) {\n  if (field != null) { try { field.setData(value); } catch (e) {} }\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-024",
+    "title": "Session-level FIT fields display location in Garmin Connect",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "garmin-connect",
+      "display"
+    ],
+    "severity": "medium",
+    "wrong": "Not understanding where session-level developer fields appear in Garmin Connect.",
+    "correct": "Session-level (MESG_TYPE_SESSION) → bottom of activity detail under 'Connect IQ' section. Record-level → per-second graphs in 'Diagramme' tab. Lap-level → Laps table.",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-025",
+    "title": "Accelerometer Y-axis direction on Garmin watches",
+    "api": "Sensor",
+    "tags": [
+      "accelerometer",
+      "axes",
+      "orientation"
+    ],
+    "severity": "critical",
+    "wrong": "Assuming negative Y-axis = arm up. Y-axis runs 6→12 o'clock (toward fingers). When arm overhead, Y ≈ +1.0g, not -1.0g.",
+    "correct": "When arm overhead hanging: Y ≈ +1.0g. When arm at side: Y ≈ -1.0g. Use Y > +0.3g for arm-overhead detection.",
+    "codeWrong": "if (yMean < -0.3) { detectArmOverhead(); }  // Backwards!",
+    "codeCorrect": "if (yMean > +0.3) { detectArmOverhead(); }  // Y positive when arm up",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-026",
+    "title": "Menu2 symbols are IDs not strings",
+    "api": "WatchUi",
+    "tags": [
+      "ui-menus",
+      "menu2"
+    ],
+    "severity": "medium",
+    "wrong": "Using string IDs for Menu2 MenuItem.",
+    "correct": "Use symbol IDs (colons): MenuItem(label, subLabel, :symbolId, {}).",
+    "codeWrong": "menu.addItem(new WatchUi.MenuItem(\"Free\", \"Mode\", \"free\", {}));",
+    "codeCorrect": "menu.addItem(new WatchUi.MenuItem(\"Free\", \"Mode\", :free, {}));",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-027",
+    "title": "Application.Storage vs Application.Properties",
+    "api": "Application",
+    "tags": [
+      "storage",
+      "persistence",
+      "data"
+    ],
+    "severity": "high",
+    "wrong": "Using Application.Properties for session history or arbitrary runtime data.",
+    "correct": "Use Application.Storage for arbitrary runtime data (arrays, dictionaries) without XML declaration. Properties requires keys declared in properties.xml and silently fails for undeclared keys.",
+    "codeWrong": "Application.Properties.setValue(\"sessionHistory\", myArray);  // May silently fail",
+    "codeCorrect": "Application.Storage.setValue(\"sessionHistory\", myArray);",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-028",
+    "title": "Communications callback requires typed signature",
+    "api": "Communications",
+    "tags": [
+      "networking",
+      "callbacks",
+      "type-system"
+    ],
+    "severity": "critical",
+    "wrong": "Registering a communications callback without type annotations.",
+    "correct": "Must have exact signature: function callback(responseCode as Lang.Number, data as Lang.Dictionary or Lang.String or Null) as Void",
+    "codeWrong": "function onWebResponse(code, data) { ... }",
+    "codeCorrect": "function onWebResponse(responseCode as Lang.Number, data as Lang.Dictionary or Lang.String or Null) as Void { ... }",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-030",
+    "title": "Android Gradle requires JDK 21",
+    "api": "Build",
+    "tags": [
+      "android",
+      "build",
+      "jdk"
+    ],
+    "severity": "critical",
+    "wrong": "Using system JDK 25 for Android builds.",
+    "correct": "Set org.gradle.java.home in gradle.properties to JDK 21 (Android Studio bundled JBR). JDK 25 causes 'Unsupported class file major version 69'.",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-031",
+    "title": "Garmin Mobile SDK 2.4.0 ServiceUnavailableException",
+    "api": "Build",
+    "tags": [
+      "android",
+      "build",
+      "garmin-sdk"
+    ],
+    "severity": "high",
+    "wrong": "Not catching ServiceUnavailableException from registerForAppEvents() in SDK 2.4.0.",
+    "correct": "SDK 2.4.0 requires try-catch around registerForAppEvents() and unregisterForApplicationEvents().",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-032",
+    "title": "Windows: Git Bash not WSL for build scripts",
+    "api": "Build",
+    "tags": [
+      "build",
+      "windows",
+      "shell"
+    ],
+    "severity": "high",
+    "wrong": "Running build scripts in PowerShell's bash (WSL), which cannot access Windows npm/gradlew.",
+    "correct": "Use Git Bash: \"C:\\Program Files\\Git\\bin\\bash.exe\" for builds. WSL cannot access Windows npm/gradle.",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-035",
+    "title": "FIT lap timestamp gotcha in webapp parser",
+    "api": "FitContributor",
+    "tags": [
+      "fit",
+      "parsing",
+      "timestamps"
+    ],
+    "severity": "high",
+    "wrong": "Not handling FIT lap records that appear before the first record, causing epoch-like timestamps.",
+    "correct": "Post-process: relativize any lap with timestamp > 86400 by subtracting startTimestamp.",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-036",
+    "title": "Attention.vibrate() array is limited to 8 VibeProfile entries",
+    "api": "Attention",
+    "tags": [
+      "haptics",
+      "crash",
+      "Too Many Arguments"
+    ],
+    "severity": "critical",
+    "wrong": "Passing more than 8 VibeProfile objects to Attention.vibrate(). The SDK silently accepts the call at compile time but throws 'Too Many Arguments Error' at runtime.",
+    "correct": "Keep the VibeProfile array to a maximum of 8 entries. For complex patterns, merge adjacent short pulses or reduce the number of repeat pulses.",
+    "codeWrong": "Attention.vibrate([\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 120),\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 120),\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 120),\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 120),\n  new Attention.VibeProfile(100, 400)  // 9 entries — CRASH\n]);",
+    "codeCorrect": "// Max 8 entries: 4 pulses + 3 pauses = 7 entries (safe)\nAttention.vibrate([\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 120),\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 120),\n  new Attention.VibeProfile(100, 250), new Attention.VibeProfile(0, 150),\n  new Attention.VibeProfile(100, 400)\n]);",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-037",
+    "title": "Custom module functions called from AppBase.onStop() crash with Illegal Access",
+    "api": "Application",
+    "tags": [
+      "lifecycle",
+      "crash",
+      "module",
+      "onStop"
+    ],
+    "severity": "critical",
+    "wrong": "Calling custom module functions from Application.AppBase.onStop(). Module symbols can be partially unresolved during AppBase teardown, causing an uncatchable 'Illegal Access (Out of Bounds) / Failed invoking <symbol>' crash that bypasses any try/catch.",
+    "correct": "Do not call custom module functions from onStop(). Move any final save/flush logic to onTimer() or another lifecycle event earlier in the session. HTTP requests from onStop() are also unreliable as the network stack may be shutting down.",
+    "codeWrong": "function onStop(state) {\n  try { Telemetry.flushNow(); } catch (e) {}  // try/catch NOT reached\n}",
+    "codeCorrect": "function onStop(state) {\n  // Do nothing here — module teardown is unsafe.\n  // Telemetry is flushed periodically via recordSession() and on next app boot.\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-038",
+    "title": "Long literal needs 'l' suffix, not bare 0",
+    "api": "Language",
+    "tags": [
+      "language",
+      "literals",
+      "long",
+      "compile"
+    ],
+    "severity": "high",
+    "wrong": "Declaring a `Lang.Long` field or local with a bare integer literal: `public var t as Lang.Long = 0;`. The compiler infers Number for the RHS and refuses the assignment.",
+    "correct": "Use the `l` suffix on every Long literal — including the default value, ternaries, and arithmetic constants. `Toybox.System.getTimer()` returns Long, so the field type must match its literal seeds.",
+    "codeWrong": "public var startedAtMs as Lang.Long = 0;\nvar elapsed = nowMs - 0;     // Number, not Long",
+    "codeCorrect": "public var startedAtMs as Lang.Long = 0l;\nvar elapsed = nowMs - 0l;    // Long\nvar seconds = (nowMs / 1000l).toNumber();",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-039",
+    "title": "Time.Moment ctor takes Number seconds, not Long milliseconds",
+    "api": "Time",
+    "tags": [
+      "time",
+      "moment",
+      "long",
+      "compile"
+    ],
+    "severity": "high",
+    "wrong": "Passing a `Long` value (e.g. `nowMs / 1000`) to `new Time.Moment(...)`. The constructor signature is `Moment(value as Lang.Number)`; a Long argument fails to type-check.",
+    "correct": "Divide by `1000l` then call `.toNumber()` on the result so the argument arrives as Number. Also documents intent (epoch SECONDS, not millis).",
+    "codeWrong": "new Time.Moment(nowMs / 1000)",
+    "codeCorrect": "new Time.Moment((nowMs / 1000l).toNumber())",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-040",
+    "title": "String equality with != compares references, not contents",
+    "api": "Language",
+    "tags": [
+      "language",
+      "strings",
+      "equality",
+      "runtime"
+    ],
+    "severity": "high",
+    "wrong": "Using `==` / `!=` on string values: `if (a != b) { ... }`. This compares object references; two strings with the same content can fail the check. Caused a silent unit-test failure in testDayRoundTrip until equals() was used.",
+    "correct": "Call `.equals()` for string content comparison. Same rule for any object type — `==` is reference equality on objects in Monkey C.",
+    "codeWrong": "if (a.dayId != b.dayId) { ... }",
+    "codeCorrect": "if (!a.dayId.equals(b.dayId)) { ... }",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-041",
+    "title": "Stray permission in manifest invalidates the whole <permissions> block",
+    "api": "Manifest",
+    "tags": [
+      "manifest",
+      "permissions",
+      "runtime-crash"
+    ],
+    "severity": "critical",
+    "wrong": "Listing a permission in manifest.xml that the device doesn't support (e.g. Background on a Venu 3 app). The simulator/device silently rejects the whole permissions block instead of granting the valid ones, so legitimate calls like Position.enableLocationEvents() crash at runtime with no permission.",
+    "correct": "Only list permissions the app currently exercises AND that the target device supports. Remove unused ones (Background, SensorLogging, etc.) when they're not actually needed. Re-add per feature so a regression is obvious.",
+    "codeWrong": "<iq:permissions>\n  <iq:uses-permission id=\"Positioning\"/>\n  <iq:uses-permission id=\"Background\"/>\n  <iq:uses-permission id=\"Sensor\"/>\n</iq:permissions>",
+    "codeCorrect": "<iq:permissions>\n  <iq:uses-permission id=\"Positioning\"/>\n  <iq:uses-permission id=\"Sensor\"/>\n</iq:permissions>",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-042",
+    "title": "Single-level undo pattern for touch-confirmable actions",
+    "api": "Application",
+    "tags": [
+      "ux",
+      "state",
+      "undo",
+      "touch"
+    ],
+    "severity": "low",
+    "wrong": "Building a multi-level undo stack on a watch UI without a visible history. Users cannot see what's queued, can't tell what 'undo' will do, and a deep stack invites destroying real data after a long session.",
+    "correct": "Keep one slot: lastUndoableAction as Lang.Dictionary?. Each user-tap that increments / pushes writes a marker; undo pops it and reverses just that action. Show the menu entry only when canUndo(). Refuse to undo state transitions that would lose accrued data (e.g. don't pop an item once attempts are recorded against it).",
+    "codeWrong": "// stack-based; user can't see what's queued\nvar undoStack = [];\nundoStack.add({ \"kind\" => \"attempt\", ... });",
+    "codeCorrect": "public var lastUndoableAction as Lang.Dictionary? = null;\nfunction logAttempt() {\n  b.attempts++;\n  lastUndoableAction = { \"kind\" => \"attempt\", \"spot\" => s.id, \"item\" => b.id };\n}\nfunction canUndo() { return lastUndoableAction != null; }",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-043",
+    "title": "ActivityRecording slot is system-wide — release it on app exit",
+    "api": "ActivityRecording",
+    "tags": [
+      "activity-recording",
+      "lifecycle",
+      "onStop",
+      "fit",
+      "crash"
+    ],
+    "severity": "critical",
+    "wrong": "Leaving AppBase.onStop empty when the app calls ActivityRecording.createSession. If the user exits via BACK (or the watch reboots / battery dies) mid-session, the Session object is never save()'d or discard()'d. The recording slot is system-wide and stays pinned in firmware; the next launch's createSession() throws 'Cannot create a new session while recording is active' and the app crashes on START. Confirmed on Venu 3 / FW 17.05 / CIQ 5.2.0.",
+    "correct": "Every app calling createSession MUST close the Session before AppBase exits. Pattern: (1) wrap createSession in try/catch — surface a non-fatal toast 'Stop other activity first' instead of crashing if the slot is already held by another app. (2) save()/discard() must null _session + clear isRecording so a second cleanup pass is a no-op. (3) expose hasOpenSession() on the session wrapper. (4) AppBase.onStop calls an INSTANCE method on the view (_view.onAppTerminate) — never a top-level Module.func() call. Module symbol lookups can be unresolved during teardown, throwing an uncatchable 'Illegal Access / Failed invoking <symbol>' that bypasses try/catch. Instance methods on objects the App still holds a reference to resolve via the vtable and are safe.",
+    "codeWrong": "function onStop(state) {}  // leaks the recording slot\n\nfunction onStop(state) { Telemetry.flush(); session.save(); }  // uncatchable crash: module symbol unresolved",
+    "codeCorrect": "class FooApp extends Application.AppBase {\n    hidden var _view;\n    function onStop(state) {\n        if (_view != null) {\n            try { _view.onAppTerminate(); } catch (e) {}\n        }\n    }\n    function getInitialView() {\n        _view = new FooView();\n        return [_view, new FooDelegate(_view)];\n    }\n}\n// in FooView:\nfunction onAppTerminate() {\n    try {\n        if (isSessionActive) { stopSession(); saveSession(); }\n        else if (session.hasOpenSession()) { session.discard(); }\n    } catch (e) { try { session.discard(); } catch (e2) {} }\n}",
+    "source": "field use"
+  },
+  {
+    "id": "gotcha-044",
+    "title": "Watchdog: heavy synchronous work in ANY callback crashes the app",
+    "api": "WatchUi",
+    "tags": [
+      "watchdog",
+      "performance",
+      "onUpdate",
+      "onLayout",
+      "crash",
+      "qr",
+      "lifecycle"
+    ],
+    "severity": "critical",
+    "wrong": "Running an expensive synchronous computation inside onUpdate, onLayout, onTimer, onShow, or any input/lifecycle callback. The watch firmware enforces a per-callback time limit; exceeding it kills the app with 'Watchdog Tripped Error - Code Executed Too Long' + 'Failed invoking <symbol>'. Heavy = QR encoding (Reed-Solomon over GF(256)), big nested loops, large array allocations, image/bitmap processing, parsing. CRITICAL MISCONCEPTION: onLayout is NOT a safe haven — it has the SAME watchdog. Moving heavy work from onUpdate to onLayout does not fix the crash. Confirmed: a QR V3 encode tripped the watchdog in onUpdate AND again after being moved to onLayout, on Venu 3 / FW 17.05 / CIQ 6.0.0.",
+    "correct": "Keep every callback short — callbacks draw/handle, they do not compute. (1) If the result is CONSTANT at compile time (a QR for a fixed URL, a lookup table, static art): precompute it OFFLINE and ship it as a static array literal in the source — the watch never runs the heavy code at all. This is what QREncoder.fallbackQR()/reviewQR() do. (2) If the result depends on RUNTIME values (a QR for a per-session pairing code): compute it exactly ONCE at a deliberate user-initiated moment (e.g. inside startSession(), an input handler the user already expects to take a beat), cache it in an instance var, and have onUpdate only read the cache. (3) Never lazily compute-on-first-draw inside onUpdate — the first frame still trips the watchdog. There is no callback that is exempt; the only safe options are offline-precompute or compute-once-at-a-user-action.",
+    "codeWrong": "// CRASH: encodes a 29x29 QR every first draw — watchdog trip\nfunction onUpdate(dc) {\n    if (_qr == null) { _qr = QREncoder.encode(SOME_URL); }\n    drawQr(dc, _qr);\n}\n// STILL CRASHES: onLayout has the same watchdog\nfunction onLayout(dc) { _qr = QREncoder.encode(SOME_URL); }",
+    "codeCorrect": "// Fixed URL -> precompute offline, ship static. Zero on-device cost.\nmodule QREncoder {\n    function reviewQR() {\n        return [0x1FCF027F, 0x1040DB41, /* ...29 ints... */];\n    }\n}\nfunction initialize() { View.initialize(); _qr = QREncoder.reviewQR(); }\nfunction onUpdate(dc) { drawQr(dc, _qr); }   // callback only draws\n\n// Runtime URL -> encode once in the START handler, cache, draw from cache.\nfunction startSession() { _qr = QREncoder.encode(buildUrl(deviceCode)); }",
+    "source": "field use (QR prompt screen)"
+  },
+  {
+    "id": "gotcha-045",
+    "title": "Watchdog: re-running O(n log n)/O(n^2) work over a GROWING buffer every periodic tick",
+    "api": "WatchUi",
+    "tags": [
+      "watchdog",
+      "performance",
+      "timer",
+      "onTimer",
+      "gps",
+      "polyline",
+      "douglas-peucker",
+      "crash",
+      "era"
+    ],
+    "severity": "critical",
+    "wrong": "Calling an expensive algorithm (Douglas-Peucker line-simplify, sort, dedup, big nested loop) over a buffer that GROWS every tick, from a periodic callback (a 1 Hz app Timer, a sync tick, onUpdate of an auto-refreshing view). Douglas-Peucker is O(n log n) -> O(n^2) on the CIQ interpreter; on a few hundred points it blows the per-callback watchdog. ERA reports 'Watchdog Tripped Error - Code Executed Too Long' + 'Failed invoking <symbol>', and the symbolicated trace points INTO the heavy function (e.g. GeoUtil.douglasPeucker -> simplifyCapped -> getLivePolyline -> LiveSync._sendSync -> onTimerTick). TWO anti-patterns that look like fixes but are NOT: (1) caching the result keyed on the buffer size — useless when the buffer grows continuously (e.g. a GPS point added every few metres while the user walks), because the cache invalidates on the very next sample so the heavy call re-runs nearly every tick; (2) throttling how OFTEN you send/use the result (e.g. transmit the polyline only every 6th sync) — the watchdog cost is in COMPUTING the result, which still happens every call, not in transmitting it. Confirmed on Venu 3 / FW 17.05 in a GPS-tracking device app: Ramer-Douglas-Peucker over up to 900 GPS points re-run on essentially every sync; survived 5 ship attempts (cache, lowered cap, send-throttle) because none removed the per-call compute.",
+    "correct": "Keep periodic-callback work O(n) and cheap; do the expensive high-fidelity pass ONCE, off the hot path. For a live/preview rendering of a growing series, decimate by STRIDE — take every ceil(n/cap)-th element plus the last — which is O(n) with no RDP and gives a recognisable track. Run the real Douglas-Peucker exactly once at a deliberate, non-periodic moment (session end / explicit user action), cache that, and serve it post-hoc. Also cap the raw buffer small (e.g. 300, halve-decimate above) so even that single high-fidelity pass stays under the watchdog budget. Diagnosis tip: a watchdog crash is NOT out-of-memory — pull the ERA field trace (it symbolicates the exact heavy frame) before hypothesising; an OOM frequently leaves no ERA entry at all, whereas a watchdog trip names the function.",
+    "codeWrong": "// CRASH on long sessions: RDP re-runs over the whole growing buffer\n// every sync, because the size-keyed cache invalidates on each new point.\nfunction getLivePolyline() as Array {\n    if (_liveRawSize == _gpsRaw.size()) { return _liveCache; }   // never hits while moving\n    _liveCache = GeoUtil.simplifyCapped(_gpsRaw, TOL, CAP);       // O(n log n)->O(n^2) every tick\n    _liveRawSize = _gpsRaw.size();\n    return _liveCache;\n}",
+    "codeCorrect": "// Live path: O(n) stride decimation, NO Douglas-Peucker.\nfunction getLivePolyline() as Array {\n    var n = _gpsRaw.size();\n    if (!_gpsEnabled || n < 2) { return []; }\n    if (_liveRawSize == n) { return _liveCache; }\n    var cap = Constants.POLYLINE_MAX_SIMPLIFIED;\n    var stride = (n + cap - 1) / cap;            // ceil(n/cap)\n    if (stride < 1) { stride = 1; }\n    var out = [] as Array;\n    for (var i = 0; i < n; i += stride) { out.add(_gpsRaw[i]); }\n    if ((n - 1) % stride != 0) { out.add(_gpsRaw[n - 1]); }   // keep latest fix\n    _liveCache = out; _liveRawSize = n;\n    return out;\n}\n// Full RDP fidelity computed ONCE, off the hot path:\nfunction stopSession() { _gpsSimplified = GeoUtil.simplifyCapped(_gpsRaw, TOL, CAP); }",
+    "source": "field use (GPS live route/elevation sync; diagnosed from Connect IQ crash reports)"
+  },
+  {
+    "id": "gotcha-046",
+    "title": "Watch face complication subscriptions must be released on app exit — dangling callback crashes",
+    "api": "Complications",
+    "tags": [
+      "complications",
+      "watchface",
+      "lifecycle",
+      "onStop",
+      "subscribe",
+      "crash"
+    ],
+    "severity": "high",
+    "wrong": "A watch face calls Complications.registerComplicationChangeCallback(method(:onX)) + subscribeToUpdates() but never unsubscribes. The subscription outlives the face: when the publisher app (e.g. a paired device app) pushes an update while the face is being torn down / suspended (settings change, app-switch, face swap), the system invokes the change callback into a half-dead face context, throwing an uncatchable 'System Error — Failed invoking <symbol>'. try/catch around the subscribe site does NOT help — the throw is on the system's later invoke, not on your call. The symbolicated backtrace is scrambled (unrelated onLayout/onSettingsChanged frames stitched together), a tell-tale of a VM dying mid-suspend rather than a bug at any single listed line. Confirmed Venu 3 / FW 17.05 (a watch face subscribing to a device app's published complication).",
+    "correct": "Mirror the publisher-side teardown guard on the subscriber. AppBase.onStop calls an INSTANCE method on the view the App still holds (_view.onAppTerminate) — never a top-level Module.func() — which calls release() on the complication-source object: guard on (Toybox has :Complications), then Complications.unsubscribeFromAllUpdates() in try/catch and reset link/id state so a second pass is a no-op. There is NO SDK call to unregister the change callback, so unsubscribing from all updates (which stops delivery) is the available lever. Keep the subscription across onHide (a hidden face still wants change events, e.g. a day-rollover staleness stamp) — only drop it at onStop. This is the subscriber-side twin of gotcha-043's publisher guard.",
+    "codeWrong": "// in the complication source, called once, never undone:\nComplications.registerComplicationChangeCallback(method(:onComplicationChange));\nComplications.subscribeToUpdates(id);\n// AppBase.onStop empty -> subscription outlives the face -> publisher push\n// invokes onComplicationChange into a torn-down context: uncatchable\n// 'Failed invoking <symbol>'.",
+    "codeCorrect": "class FaceApp extends Application.AppBase {\n    private var _view;\n    function onStop(state) { if (_view != null) { _view.onAppTerminate(); } }\n}\n// in FaceView:\nfunction onAppTerminate() { if (_src != null) { _src.release(); } }\n// in the complication source:\nfunction release() {\n    if (!(Toybox has :Complications)) { return; }\n    try { Complications.unsubscribeFromAllUpdates(); } catch (e) {}\n    _packId = null; _legacyId = null; _callbackRegistered = false;\n}",
+    "source": "field use (watch face)"
+  },
+  {
+    "id": "gotcha-047",
+    "title": "updateComplication addresses the DECLARED complication id from complications.xml — not the declaration order",
+    "api": "Complications",
+    "tags": [
+      "complications",
+      "publisher",
+      "updateComplication",
+      "resources",
+      "silent-failure"
+    ],
+    "severity": "critical",
+    "wrong": "A publisher declares complications with id=\"1\"..id=\"4\" in complications.xml but calls Complications.updateComplication(0..3, {...}) assuming the first argument is the 0-based declaration order. The argument is resolved against the DECLARED id attribute (0-255, any values). Publishing to a nonexistent id throws Lang.OperationNotAllowedException — and because publishers typically wrap updateComplication in a best-effort try/catch, the whole bridge dies SILENTLY: subscribers only ever see each complication's resource-declared default value. Deceptive extras: (a) offset-by-one ids still 'work' — values land on the WRONG complications; (b) a subscriber-side sim test that edits the declared default to fake data validates parse/display while completely masking the dead publish path (this hid a dead publish path from a device app to its watch face for multiple releases); (c) everything compiles clean.",
+    "correct": "Keep the runtime constants equal to the id=\"N\" attributes declared in complications.xml (e.g. ids 1..4 -> updateComplication(1..4)). Verify the PUBLISH path end-to-end in a WARM simulator session: run the publisher app fully (past the glance!) so it calls updateComplication with non-default values, then — without closing the sim — load the subscriber face and confirm it renders those values (not the resource defaults). A declared-default-swap test only validates the subscriber.",
+    "source": "field use (packed complication dead on device and simulator; Garmin forum threads 359180, 317937)",
+    "codeWrong": "// complications.xml: <complication id=\"1\" .../> ... <complication id=\"4\" .../>\nconst COMPLICATION_COUNT_INDEX = 0;  // \"declaration order\" — WRONG\nconst COMPLICATION_DATA_INDEX     = 3;\nComplications.updateComplication(COMPLICATION_DATA_INDEX, {:value => pack});\n// -> OperationNotAllowedException for id 0 / id 4 never written,\n//    swallowed by the best-effort catch -> subscribers see defaults forever.",
+    "codeCorrect": "// complications.xml: <complication id=\"1\" .../> ... <complication id=\"4\" .../>\nconst COMPLICATION_COUNT_INDEX = 1;  // == declared id attribute\nconst COMPLICATION_DATA_INDEX     = 4;\nComplications.updateComplication(COMPLICATION_DATA_INDEX, {:value => pack});"
+  },
+  {
+    "id": "gotcha-048",
+    "title": "The Connect IQ simulator DOES accept swipes — but only a real press-drag-release; a short/one-sided/single-move drag is dropped, and a rightward swipe maps to BACK",
+    "api": "WatchUi",
+    "tags": [
+      "simulator",
+      "onSwipe",
+      "InputDelegate",
+      "BehaviorDelegate",
+      "touch",
+      "swipe",
+      "testing"
+    ],
+    "severity": "medium",
+    "wrong": "Assuming swipe gestures can't be exercised in the CIQ simulator (so onSwipe / onNextPage / onPreviousPage behaviour is 'untestable'). In practice a poorly-synthesised drag silently does nothing: too short (<~20% of the display), one-sided toward an edge (lands in the bezel / edge back-swipe zone), or a single mouse-move (the sim classifies it as a click), so the app never sees the swipe and the tester wrongly concludes swipes don't work.",
+    "correct": "The simulator accepts swipes via a genuine mouse press-hold -> drag -> release over the watch face (hold the left button, drag, then release). For synthetic/automated input: CENTRE the drag on the face centre (both ends stay mid-face), HOLD ~0.12s after mouse-down before moving, and STEP the drag through several discrete moves over ~40% of the display width/height. CAVEAT: a rightward drag (SWIPE_RIGHT) is consumed as the BACK gesture on touch devices in the simulator and never reaches onSwipe as SWIPE_RIGHT — verify right-swipe behaviour on real hardware (it does reach onSwipe on-device). up/down and left register fine.",
+    "codeWrong": "# ciqsim pm_swipe (old): 12%-wide one-sided single-move drag -> sim drops it\npyautogui.mouseDown(); pyautogui.moveTo(sx - d, sy, duration=0.3); pyautogui.mouseUp()",
+    "codeCorrect": "# centred, press-settled, stepped drag -> sim registers a real swipe\npyautogui.mouseDown(); time.sleep(0.12)\nfor i in range(1,13):\n    t=i/12.0; pyautogui.moveTo(cx-ux*h+ux*2*h*t, cy-uy*h+uy*2*h*t, duration=0.03)\npyautogui.mouseUp()",
+    "source": "Garmin forum thread 217388, plus the ciqkit pm_swipe fix; verified in-simulator (up = +/-1 scroll, left = +10 jump)"
+  },
+  {
+    "id": "gotcha-049",
+    "title": "System.getTimer() is a 32-bit SIGNED ms counter and goes NEGATIVE after ~24.9 days of uptime - never compare raw values, only deltas",
+    "api": "System",
+    "tags": [
+      "timer",
+      "getTimer",
+      "overflow",
+      "wraparound",
+      "uptime",
+      "input",
+      "onTap",
+      "state-machine",
+      "crash-class"
+    ],
+    "severity": "critical",
+    "wrong": "Treating System.getTimer() as a monotonically increasing positive number, and comparing RAW timer values against a stored deadline or a 0/unset sentinel. getTimer() returns Lang.Number, which is 32-bit SIGNED: it wraps past 2^31 ms and is NEGATIVE once the watch has been up ~24.9 days. Devices are rarely rebooted, so 'negative' is the NORMAL state for a well-used watch, not an exotic edge case - and it never reproduces in the simulator, which starts its timer near zero. The classic shape is a deadline field defaulting to 0: `_lockUntilMs = 0; function isLocked(now) { return now < _lockUntilMs; }`. With a negative now, `now < 0` is TRUE, so the feature is 'active' from the very first frame with no user action. Confirmed on Venu 3: an alarm app's ring screen booted permanently input-locked (showing its penalty state with an attempt count of 0), swallowed every tap in onTap as 'penalty running', rejected even the CORRECT answer inside answer(), and - because onBack deliberately refuses to dismiss a ringing alarm - left the user unable to leave the app at all. Diagnosed only from a user's photo of the watch. NOTE the second-order trap: `deadline = now + PENALTY_MS` also OVERFLOWS to a negative Number when now is near 2^31, so a naive Long-widening 'fix' that forgets this can convert a 2-second lock into a permanent one.",
+    "correct": "Never compare two raw getTimer() readings. (1) Hold an explicit BOOLEAN for 'is this timed state active' instead of inferring it from a sentinel value - a 0 default is indistinguishable from 'in the past' once the clock is negative. (2) Compare only DELTAS, widened to Lang.Long so the subtraction cannot itself overflow: `(deadline.toLong() - now.toLong())`. (3) CLAMP the delta to the interval you actually set: a remaining time larger than the original duration means the counter wrapped between set and read, so treat it as elapsed rather than as forever. (4) Clamp elapsed-time deltas at 0, so a wrap cannot report a huge elapsed value and instantly trigger a timeout/expiry path. (5) Unit-test with negative and near-2^31 timer values - the sim will never produce them by itself. Same rule applies to any Number accumulator compared across a long uptime.",
+    "codeWrong": "hidden var _lockUntilMs = 0;   // 'unset'\n\nfunction isLocked(nowMs) {\n    return nowMs < _lockUntilMs;      // nowMs < 0 => TRUE, forever, from frame one\n}\nfunction lockRemainingMs(nowMs) {\n    var r = _lockUntilMs - nowMs;     // 0 - (-2e9) => huge => full-screen countdown\n    return r > 0 ? r : 0;\n}\n// and every input handler then does:\nif (session.isLocked(System.getTimer())) { return true; }   // swallows ALL taps",
+    "codeCorrect": "hidden var _lockUntilMs = 0;\nhidden var _lockActive = false;      // explicit, not inferred from a sentinel\n\nfunction startPenalty(nowMs) {\n    _lockUntilMs = nowMs + Constants.PENALTY_MS;   // may overflow; that is fine\n    _lockActive = true;\n}\n\nfunction lockRemainingMs(nowMs) {\n    if (!_lockActive) { return 0; }\n    var r = _lockUntilMs.toLong() - nowMs.toLong();       // widen: no overflow\n    if (r <= 0) { return 0; }\n    if (r > Constants.PENALTY_MS) { return 0; }           // wrapped => self-heal\n    return r.toNumber();\n}\n\nfunction isLocked(nowMs) {\n    if (!_lockActive) { return false; }\n    if (lockRemainingMs(nowMs) <= 0) { _lockActive = false; return false; }\n    return true;\n}\n\nfunction elapsedSecs(nowMs) {\n    var d = nowMs.toLong() - _startedAtMs.toLong();\n    if (d < 0) { d = 0; }                                 // wrap => 0, not huge\n    return (d / 1000).toNumber();\n}",
+    "source": "field use on Venu 3 - screen permanently input-locked; reproduced only on hardware, invisible in the simulator"
+  },
+  {
+    "id": "gotcha-050",
+    "title": "'Touch is not working on device' is almost always YOUR guard swallowing the event - and never ship a screen with no escape",
+    "api": "WatchUi",
+    "tags": [
+      "touch",
+      "onTap",
+      "input",
+      "BehaviorDelegate",
+      "onBack",
+      "debugging",
+      "ux",
+      "device-only"
+    ],
+    "severity": "high",
+    "wrong": "Concluding from 'no tap does anything on the watch' that touch input is broken/undelivered, and hunting for a delivery bug (wrong delegate type, pushView from a menu delegate, missing onTap, device touch quirk). Input delivery is rarely the problem. Far more often the events ARRIVE and the app's own state machine discards them: an input handler that early-returns while some 'busy/locked/cooldown' flag is set, plus a state machine that also rejects the action internally, makes a perfectly responsive screen look completely dead. It becomes unrecoverable when onBack() returns true (a deliberate choice for alarms, workouts, confirmations), because then even leaving is swallowed and the only way out is a force-kill.",
+    "correct": "Diagnose from what is DRAWN before assuming anything about input. The screen renders its own state: if it is showing the 'locked/busy' variant, taps are being received and deliberately dropped, and the bug is in whatever sets that flag - not in touch. A tell-tale is a busy/penalty state displayed with a zero counter (locked, but nothing has happened yet). Then: (1) make every swallow path observably temporary - a countdown that visibly shrinks, and a hard ceiling that self-releases; (2) never let a screen be simultaneously input-swallowing AND non-dismissible with no timeout - if onBack must return true, guarantee an automatic escape (a max duration that navigates away) and let demo/test variants of the screen be dismissed normally; (3) request a photo of the watch for a device-only report - the drawn state usually names the bug faster than any log.",
+    "codeWrong": "// Delegate: every tap swallowed while the flag is set...\nfunction onTap(evt) {\n    if (session.isLocked(System.getTimer())) { return true; }   // silent drop\n    ...\n}\n// ...the state machine ALSO refuses the action...\nfunction answer(idx, nowMs) {\n    if (isLocked(nowMs)) { return false; }   // correct answer does nothing either\n    ...\n}\n// ...and back is deliberately disabled:\nfunction onBack() { return true; }          // => user is trapped",
+    "codeCorrect": "// 1. A swallow must be visibly temporary and self-limiting.\nfunction onTap(evt) {\n    if (session.isLocked(System.getTimer())) {\n        WatchUi.requestUpdate();            // draw the shrinking countdown\n        return true;\n    }\n    ...\n}\n\n// 2. A hard ceiling that navigates away, so no state is terminal.\nfunction onRepaint() {\n    _session.tick(System.getTimer());\n    if (_session.outcome() == Constants.OUTCOME_EXPIRED) { _finalizeAndGoHome(); return; }\n    WatchUi.requestUpdate();\n}\n\n// 3. Demo/test variants stay dismissible.\nfunction onBack() {\n    if (_view.session().isTest()) { WatchUi.popView(WatchUi.SLIDE_DOWN); return true; }\n    return true;   // real alarm: back must not silence it\n}",
+    "source": "field use - reported as 'no touch event is accepted, I cannot exit the app'; root cause was gotcha-049 (negative getTimer) leaving the input guard permanently true"
+  },
+  {
+    "id": "gotcha-051",
+    "title": "Attention (vibrate/playTone) is FOREGROUND-ONLY: not in a watch face, not in a background service - so no CIQ app can wake a sleeping user unless it is left open",
+    "api": "Attention",
+    "tags": [
+      "attention",
+      "vibrate",
+      "playTone",
+      "background",
+      "watchface",
+      "alarm",
+      "requestApplicationWake",
+      "app-types"
+    ],
+    "severity": "critical",
+    "wrong": "Assuming an alarm/reminder can buzz the user while the app is closed - via a background ServiceDelegate, or by building a companion WATCH FACE to 'bridge the gap' since watch faces are always running. Both are dead ends, and neither fails loudly: Attention calls from a background service are simply no-ops, so the code looks correct, compiles, throws nothing, and silently never buzzes. Worse, the SYSTEM's own notification vibration for the Background.requestApplicationWake() dialog fires at the same moment, which is easily mistaken for proof that your own vibrate() worked. It is not - a buzz felt next to a system dialog proves nothing about your call.",
+    "correct": "The Toybox.Attention API documentation restricts it to a short list of app types: audio content providers, data fields, glances, watch apps and widgets. Watch faces are not on it, and background service processes are not a foreground context. Garmin staff have said on the developer forum more than once that vibration and tones only work from the foreground process and never from a watch face or a background process. requestApplicationWake only raises a PROMPT that the user must accept, and a sleeping user cannot accept it. A watch face cannot auto-launch an app either - the only path is hold-to-launch complications, a deliberate gesture. CONCLUSION: the ONLY way a Connect IQ app can wake a sleeping user is to be LEFT OPEN in the foreground and ring from its own Timer. Every working CIQ alarm app does this (SmartWake Pro et al) and it costs 15-30% battery per night on Venu-class hardware. Design for that, say so in the UI and the store listing, and do not let anything depend on a background buzz.",
+    "codeWrong": "// Background service - compiles, throws nothing, buzzes NOTHING.\n(:background)\nclass MyServiceDelegate extends System.ServiceDelegate {\n    function onTemporalEvent() as Void {\n        Attention.vibrate([new Attention.VibeProfile(100, 2000)]);  // no-op\n        Background.requestApplicationWake(\"wake up\");   // prompt only\n        Background.exit(null);\n    }\n}\n// A watch face 'bridge' fails the same way: Attention is unavailable there,\n// and a face cannot launch the app by itself.",
+    "codeCorrect": "// The app must be LEFT OPEN. Record an absolute target when arming, then let\n// the foreground view watch the clock and ring itself - no dialog involved.\nfunction onRefresh() as Void {                     // Timer, every few seconds\n    if (AlarmScheduler.keepAwakeDue(Time.now().value(),\n            AlarmStore.targetAt(), Constants.KEEPAWAKE_SLACK_S)) {\n        startRinging();       // full-strength Attention works here\n        return;\n    }\n    WatchUi.requestUpdate();\n}\n// keepAwakeDue() is pure: fires at/after the target but NOT hours later, and\n// the slack window stops a late tick from skipping the alarm entirely.\n// Tell the user: show KEEP APP OPEN while armed, and say it in the listing.",
+    "source": "field use; Garmin forum threads 357743 and 387721, plus the Toybox.Attention API docs"
+  },
+  {
+    "id": "gotcha-052",
+    "title": "try/catch does NOT catch VM Errors - 'Invalid Value', 'Unexpected Type', 'Too Many Timers', 'Watchdog Tripped' all kill the app from INSIDE a try block",
+    "api": "Lang",
+    "tags": [
+      "exception",
+      "error",
+      "try-catch",
+      "FitContributor",
+      "setData",
+      "Timer",
+      "crash",
+      "crash-report"
+    ],
+    "severity": "critical",
+    "wrong": "Wrapping a risky call in try/catch and treating it as handled. Monkey C has two failure hierarchies: Lang.Exception (InvalidValueException, UnexpectedTypeException, ...), which try/catch catches, and VM Errors ('Invalid Value', 'Unexpected Type Error', 'Too Many Timers Error', 'Watchdog Tripped Error', 'Out Of Memory Error'), which it does NOT. The trap is that the crash report's backtrace points at the line INSIDE the try, so the code looks like it should have been safe. Two production crashes were exactly this: 'Invalid Value' at `try { field.setData(value); } catch (e) {}` in a helper literally named _safeSetData, and 'Too Many Timers Error' at `try { _timer.start(...) } catch (e) { _timer = null; }`.",
+    "correct": "Prevent, do not catch. Make the value or the state valid BEFORE the call: clamp a number into the field's declared FIT type (null/NaN/negative/over-range are all fatal), and keep concurrent Timer.Timer objects under the device limit instead of hoping the allocation failure is catchable. Keep the try/catch for the genuine Lang.Exception cases, but never let it be the only defence. The two working guards are a clamp helper for FIT values and a small timer pool (see gotcha-053).",
+    "codeWrong": "// Reads as safe. Is not: setData() raises a VM Error, and the\n// crash trace points at this exact line, inside the try.\nhidden function _safeSetData(field, value) {\n    if (field != null) {\n        try { field.setData(value); } catch (e) {}\n    }\n}",
+    "codeCorrect": "// Clamp first — null/NaN/negative/over-range never reach setData().\n// NaN fails every comparison, so it falls through to 0.\nfunction u(value, maxVal) {\n    if (value == null) { return 0; }\n    if (value instanceof Toybox.Lang.Number) {\n        if (value < 0) { return 0; }\n        if (value > maxVal) { return maxVal; }\n        return value;\n    }\n    if (value instanceof Toybox.Lang.Float) {\n        if (value >= maxVal) { return maxVal; }\n        if (value >= 0) { return value.toNumber(); }\n    }\n    return 0;\n}",
+    "source": "field use (two production crash reports: Invalid Value in a try-wrapped FitContributor.Field.setData, Too Many Timers in a try-wrapped Timer.start)"
+  },
+  {
+    "id": "gotcha-053",
+    "title": "An app gets about THREE concurrent Timer.Timer objects - the fourth raises an uncatchable 'Too Many Timers Error'",
+    "api": "Timer",
+    "tags": [
+      "timer",
+      "crash",
+      "error",
+      "resource-limit",
+      "crash-report"
+    ],
+    "severity": "high",
+    "wrong": "Giving every transient screen its own Timer.Timer - a toast auto-dismiss, a delayed commit for a double-tap window, an overlay timeout, an animation frame timer, a banner auto-dismiss - on top of the always-on 1 Hz session tick. Each looks harmless in isolation; they are only ever live at the same moment on a busy screen, which is why it survives testing and dies in the field. The SDK docs state it plainly: 'The number of available timers (default 3) and the minimum time value (default 50 ms) depends on the host system. An error will occur if too many timers are set.' The error is a VM Error, so the try/catch around `new Timer.Timer()` does not catch it (see gotcha-052).",
+    "correct": "Pool them. Keep ONE real repeating Timer that ages a small queue of scheduled callbacks and fires whatever came due, and give callers an integer handle instead of a Timer object. The pooled timer runs only while something is queued, so an idle app pays nothing. Leave at most one other real Timer for a genuinely always-on tick. Also make every _startTimer() idempotent (stop before start): an onShow() that runs twice with no onHide() in between otherwise leaks the first timer.",
+    "codeWrong": "// Six of these across one app = crash on the fourth concurrent one.\nprivate function _startTimer() as Void {\n    try {\n        _timer = new Timer.Timer();\n        _timer.start(method(:onTimeout), 2500, false);\n    } catch (e) {\n        _timer = null;   // never reached\n    }\n}",
+    "codeCorrect": "// One shared Timer for the whole app; handle, not object.\nprivate function _startTimer() as Void {\n    _stopTimer();   // onShow can run twice without an onHide\n    _timerId = Pool.schedule(method(:onTimeout), 2500, false);\n}\n\nprivate function _stopTimer() as Void {\n    if (_timerId != 0) {\n        Pool.cancel(_timerId);\n        _timerId = 0;\n    }\n}",
+    "source": "field use (production crash report: Too Many Timers Error from a banner auto-dismiss timer on a Forerunner 965) and the Toybox.Timer API docs"
+  },
+  {
+    "id": "gotcha-054",
+    "title": "WatchUi.requestUpdate() from a covered view's timer repaints the TOP view - a 1 Hz session tick stutters every menu pushed over it",
+    "api": "WatchUi",
+    "tags": [
+      "menu",
+      "performance",
+      "timer",
+      "custommenu",
+      "ui"
+    ],
+    "severity": "medium",
+    "wrong": "A long-running main view (session screen) whose 1 Hz Timer ends every tick with WatchUi.requestUpdate(), while a Menu2 / CustomMenu / picker is pushed on top. The SDK says requestUpdate() requests onUpdate() 'for the current View' - the top of the stack, not the caller. So the menu is fully repainted once a second, including in the middle of a scroll animation, which reads as laggy scrolling on the watch. Invisible in the simulator (host-speed repaint).",
+    "correct": "Track visibility with onHide()/onShow() and skip the periodic redraw while covered. The system calls onUpdate() when the view is shown again, so nothing is lost. Event-driven redraws (a count changed) can stay; gate the periodic one.",
+    "codeWrong": "function onTimer() {\n    sessionElapsedSecs++;\n    WatchUi.requestUpdate();   // repaints the menu on top every second\n}",
+    "codeCorrect": "hidden var _covered = false;\nfunction onShow() { _covered = false; }\nfunction onHide() { _covered = true; }\nfunction onTimer() {\n    sessionElapsedSecs++;\n    if (!_covered) { WatchUi.requestUpdate(); }\n}",
+    "source": "field use (a mode picker menu pushed over a running session view, observed on a Venu 3)"
+  },
+  {
+    "id": "gotcha-055",
+    "title": "CustomMenuItem.draw() runs for every visible row on every scroll frame - do layout once, and never call System.getDeviceSettings() per frame",
+    "api": "WatchUi",
+    "tags": [
+      "custommenu",
+      "menu",
+      "performance",
+      "draw",
+      "layout"
+    ],
+    "severity": "medium",
+    "wrong": "Doing the row layout inside CustomMenuItem.draw(dc): fitting fonts with getTextWidthInPixels over several candidates, chord maths with Math.sqrt, ellipsizing, and calling System.getDeviceSettings() (which builds a large object) several times per row. The menu calls draw() for 2-3 rows on every frame of a scroll, so this runs dozens of times a second in the Monkey C VM. The simulator hides it: it runs bytecode at host speed, where the layout measured only ~4 % of a row draw.",
+    "correct": "Compute the layout on the first draw per rendering state (focused / unfocused) and Dc size, keep it as a small draw list (text ops + chip ops), and let draw() only replay it. Read screen geometry once into module vars. Same for the menu title Drawable.",
+    "codeWrong": "function draw(dc) {\n    var ds = System.getDeviceSettings();          // per row, per frame\n    var font = fitFont(dc, _name, chordAt(dc, d), fonts);\n    dc.drawText(x, y, font, _name, j);\n}",
+    "codeCorrect": "function draw(dc) {\n    var key = dc.getWidth() * 10000 + dc.getHeight();\n    if (_plan == null || _planKey != key) { _plan = _layout(dc); _planKey = key; }\n    for (var i = 0; i < _plan.size(); i++) { /* setColor + drawText from _plan[i] */ }\n}",
+    "source": "field use (a CustomMenu mode picker, profiled on-device vs. in the simulator)"
+  }
+]

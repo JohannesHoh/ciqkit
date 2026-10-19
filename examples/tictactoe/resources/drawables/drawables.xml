@@ -1,0 +1,5 @@
+<drawables>
+    <!-- Original artwork, drawn by art/make_icon.py. 70x70 here; devices that
+         want another size get their own copy under resources-<device>/. -->
+    <bitmap id="LauncherIcon" filename="launcher_icon.png"/>
+</drawables>

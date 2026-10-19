@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The application id below is unique to this project. Keep it: two apps with the
+  same id overwrite each other on a watch and in the Connect IQ store.
+-->
+<iq:manifest version="3" xmlns:iq="http://www.garmin.com/xml/connectiq">
+    <iq:application
+        id="{{UUID}}"
+        type="{{MANIFEST_TYPE}}"
+        name="@Strings.AppName"
+        entry="{{ID}}App"
+        launcherIcon="@Drawables.LauncherIcon"
+        minApiLevel="4.0.0">
+        <iq:products>
+{{PRODUCTS}}
+        </iq:products>
+        <iq:permissions/>
+        <iq:languages>
+            <iq:language>eng</iq:language>
+        </iq:languages>
+        <iq:barrels/>
+    </iq:application>
+</iq:manifest>

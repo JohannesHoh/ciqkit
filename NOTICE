@@ -1,0 +1,40 @@
+ciqkit
+Copyright 2026 Johannes Hohenbichler
+
+This product includes software developed by Johannes Hohenbichler.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+The example apps in examples/ are licensed separately under MIT No Attribution
+(MIT-0); see examples/LICENSE.
+
+--------------------------------------------------------------------------------
+Third-party material
+--------------------------------------------------------------------------------
+
+This repository contains NO Garmin source code, SDK files, documentation text,
+device images, or other Garmin-owned material.
+
+ciqkit interoperates with the Garmin Connect IQ SDK, which you install yourself
+from Garmin and which remains subject to Garmin's own licence terms. In
+particular:
+
+  * tools/sdk-mcp does not ship Garmin's API documentation. It ships a PARSER
+    that reads the SDK documentation already installed on your machine and
+    writes a local index, which never leaves your machine.
+
+  * The device frames used when rendering a "watch with strap" screenshot are
+    read at runtime from the device images in your own SDK installation. None
+    are redistributed here.
+
+"Garmin", "Connect IQ", "Venu", "Forerunner", "fenix" and related marks are
+trademarks of Garmin Ltd. or its subsidiaries. See TRADEMARKS.md.

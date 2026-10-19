@@ -1,0 +1,68 @@
+name: Bug report
+description: Something ciqkit did that it should not have, or did not do that it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ciqkit is developed on one macOS machine against a handful of projects,
+        so most rough edges you hit are ones nobody has seen. A report with a
+        reproducible case is the most useful thing you can send.
+
+        **Security issues do not go here** — please use
+        [a private advisory](https://github.com/JohannesHoh/ciqkit/security/advisories/new)
+        instead. See [SECURITY.md](https://github.com/JohannesHoh/ciqkit/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`ciqkit doctor` output"
+      description: Paste it verbatim. Most reports are answered by this alone.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The command you ran, and what it printed
+      description: The full command line and the JSON or error it produced.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: artefact
+    attributes:
+      label: The screenshot, if this is a capture problem
+      description: Drag the PNG in. A wrong screenshot is usually self-explaining.
+    validations:
+      required: false
+
+  - type: input
+    id: sdk
+    attributes:
+      label: Connect IQ SDK version and device
+      placeholder: "9.1.0, venu3"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: platform
+    attributes:
+      label: Platform
+      description: >
+        Windows simulator control is untested and Linux has no simulator at all
+        — see the platform table in the README. Reports are still welcome; this
+        just sets expectations.
+      options:
+        - label: macOS (the supported, tested platform)
+        - label: Windows
+        - label: Linux (static checks only)

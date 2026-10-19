@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ciqsim": {
+      "command": "ciqkit-mcp"
+    },
+    "garmin-sdk": {
+      "command": "npx",
+      "args": ["-y", "ciqkit-sdk-mcp"]
+    }
+  }
+}

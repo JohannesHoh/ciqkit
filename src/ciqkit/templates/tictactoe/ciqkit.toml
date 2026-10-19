@@ -1,0 +1,60 @@
+# ciqkit settings for this project. Schema: docs/config.md in the ciqkit repo.
+#
+# No [build] section: there is no scripts/build.sh either, so ciqkit uses its
+# built-in build (monkeyc from your SDK, your developer key, bin/{{DIR_NAME}}.prg,
+# and bin/{{DIR_NAME}}-test.prg for `ciqkit sim test`).
+
+[sim]
+device = "{{DEVICE}}"
+
+# Named screens: `ciqkit sim shots --all` regenerates every one of them.
+#
+# Every step is a START/ENTER press (the simulator maps the Return key to it),
+# because that is the one input all three devices share: fr255 has no touch
+# screen, and venu3 / venusq2 have no UP/DOWN buttons. The seeds make the watch
+# play AI_LEVEL 0 (always the first free cell) so each game goes the same way:
+#
+#   draw     the cursor starts in the centre and, after each watch move,
+#            jumps to the first free cell if its own was taken. You get
+#            4, 1, 3, 6, 8 and the watch 0, 2, 5, 7: a full board, no line.
+#   you-win  the same, but the cursor starts top left (CURSOR_START = 0).
+#            You get 0, 2, 4, 6 and the watch 1, 3, 5: the 2-4-6 diagonal.
+#
+# Cells are numbered 0-8, row by row from the top left.
+
+[[screens]]
+name   = "home"
+anchor = "toe"
+
+[[screens]]
+name  = "mid-game"
+steps = [
+  {kind = "key", key = "enter"},   # home -> new game
+  {kind = "key", key = "enter"},   # X in the centre, watch answers
+  {kind = "key", key = "enter"},   # X where the cursor moved to, watch answers
+]
+
+[[screens]]
+name   = "you-win"
+seed   = ["AI_LEVEL=0", "CURSOR_START=0"]
+steps  = [
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+]
+anchor = "you win"
+
+[[screens]]
+name   = "draw"
+seed   = ["AI_LEVEL=0"]
+steps  = [
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+  {kind = "key", key = "enter"},
+]
+anchor = "tie game"

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ciqsim": {
+      "command": "ciqkit-mcp"
+    },
+    "garmin-sdk": {
+      "command": "bash",
+      "args": ["../../tools/sdk-mcp/scripts/run-server.sh"]
+    }
+  }
+}

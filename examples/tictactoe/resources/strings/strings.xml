@@ -1,0 +1,12 @@
+<strings>
+    <string id="AppName">Tic-Tac-Toe</string>
+    <string id="Title">TIC TAC TOE</string>
+    <string id="Start">START</string>
+    <string id="Won">Won</string>
+    <string id="Drawn">Tied</string>
+    <string id="Lost">Lost</string>
+    <string id="YouWin">YOU WIN!</string>
+    <string id="WatchWins">WATCH WINS</string>
+    <string id="Draw">TIE GAME</string>
+    <string id="Again">AGAIN</string>
+</strings>

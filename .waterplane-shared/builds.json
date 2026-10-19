@@ -1,0 +1,43 @@
+[
+  {
+    "id": "scan_0",
+    "name": "npm run build",
+    "cmd": "npm run build"
+  },
+  {
+    "id": "scan_1",
+    "name": "wheel",
+    "cmd": "python -m build"
+  },
+  {
+    "id": "scan_2",
+    "name": "sdk-mcp · build",
+    "cmd": "npm run build",
+    "dir": "tools/sdk-mcp"
+  },
+  {
+    "id": "scan_3",
+    "name": "ruff check src tests",
+    "cmd": "ruff check src tests"
+  },
+  {
+    "id": "scan_4",
+    "name": "test",
+    "cmd": "pytest"
+  },
+  {
+    "id": "scan_5",
+    "name": "Launcher for the ciqkit SDK MCP server.",
+    "cmd": "./tools/sdk-mcp/scripts/run-server.sh"
+  },
+  {
+    "id": "scan_6",
+    "name": "pip install -e \".[dev]\"",
+    "cmd": "pip install -e \".[dev]\""
+  },
+  {
+    "id": "scan_7",
+    "name": "pytest -q",
+    "cmd": "pytest -q"
+  }
+]

@@ -1,0 +1,129 @@
+# Release: push a tag `vX.Y.Z` to publish ciqkit to PyPI and ciqkit-sdk-mcp to npm.
+#
+# This workflow has NOT been run yet. ONE-TIME SETUP the repo owner must do
+# before the first tag:
+#
+#  1. PyPI trusted publisher (no API token needed). On pypi.org, either
+#     "Publishing -> Add a new pending publisher" (project does not exist yet)
+#     or the project's Publishing settings, with:
+#         project name: ciqkit      owner: JohannesHoh      repository: ciqkit
+#         workflow:     release.yml environment: pypi
+#  2. GitHub environment: Settings -> Environments -> New environment `pypi`.
+#     Optionally add required reviewers so a tag push waits for a human click.
+#  3. npm: create an automation (or granular, publish-scoped) access token for
+#     the `ciqkit-sdk-mcp` package and store it as the repository secret
+#     NPM_TOKEN. The package name must be free on npmjs.com. (npm trusted
+#     publishing via OIDC is an alternative once the package exists: configure
+#     it on npmjs.com, then drop NPM_TOKEN and the NODE_AUTH_TOKEN line.)
+#  4. Versions: the Python version comes from src/ciqkit/__init__.py (hatch),
+#     the npm one from tools/sdk-mcp/package.json. Both must equal the tag
+#     without the leading `v`, or the job fails before publishing anything.
+#
+# The two publish jobs are independent: if one fails, the other can still have
+# gone out. Re-running a failed job is safe only for the registry that did not
+# accept the upload; neither PyPI nor npm lets you overwrite a version.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # Same suite as every PR. Publishing waits for it.
+    uses: ./.github/workflows/ci.yml
+
+  pypi:
+    name: publish ciqkit to PyPI
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write   # trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Built version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          shopt -s nullglob
+          files=(dist/*.whl dist/*.tar.gz)
+          [ "${#files[@]}" -eq 2 ] || { echo "::error::expected one wheel and one sdist, got: ${files[*]}"; exit 1; }
+          for f in "${files[@]}"; do
+            base=$(basename "$f")
+            case "$base" in
+              ciqkit-"$tag"-*|ciqkit-"$tag".tar.gz) ;;
+              *) echo "::error::$base does not match tag $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          done
+          echo "dist matches $tag"
+
+      - name: No Garmin material or keys in the artefacts
+        run: |
+          hits=$( (unzip -Z1 dist/*.whl; tar -tzf dist/*.tar.gz) \
+            | grep -Ei '\.(prg|iq|der|jks|keystore|pem)$|(^|/)bin/|sdk-index\.json' || true)
+          if [ -n "$hits" ]; then echo "::error::unexpected files in dist:"; echo "$hits"; exit 1; fi
+          echo "clean"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    name: publish ciqkit-sdk-mcp to npm
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm provenance attestation
+    defaults:
+      run:
+        working-directory: tools/sdk-mcp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: package.json version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(node -p "require('./package.json').version")
+          if [ "$ver" != "$tag" ]; then
+            echo "::error::tools/sdk-mcp/package.json is $ver but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - name: Package contains no generated SDK index
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          if grep -q 'sdk-index' /tmp/pack.json; then
+            echo "::error::sdk-index.json would be published"; exit 1
+          fi
+          node -e "
+            const f = JSON.parse(require('fs').readFileSync('/tmp/pack.json','utf8'))[0].files.map(x => x.path);
+            console.log(f.join('\n'));
+            for (const need of ['dist/index.js', 'dist/parse-sdk.js', 'data/gotchas.json', 'LICENSE']) {
+              if (!f.includes(need)) throw new Error('missing ' + need);
+            }"
+
+      - name: Publish (prepublishOnly rebuilds)
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

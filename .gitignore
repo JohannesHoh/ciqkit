@@ -1,0 +1,56 @@
+# --- Garmin SDK material: never commit ------------------------------------
+# sdk-index.json is generated from the Connect IQ SDK documentation installed
+# on your machine. That documentation is Garmin's copyrighted material, so the
+# derived index stays local and is never redistributed here.
+tools/sdk-mcp/data/sdk-index.json
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Node ------------------------------------------------------------------
+node_modules/
+tools/sdk-mcp/dist/
+*.tsbuildinfo
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Local output ----------------------------------------------------------
+# ciqkit writes screenshots to a private runtime dir by default, but people
+# often pass --out-dir ./screenshots while trying things out.
+/screenshots/
+*.prg
+*.iq
+
+# --- Signing keys: never commit --------------------------------------------
+# CI rejects these outright (see the no-garmin-material job); ignoring them here
+# means an accidental `git add .` cannot stage a developer key in the first place.
+*.der
+*.jks
+*.keystore
+
+# coverage data
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# phone transport dirs — do not commit
+.claude/inbox
+.claude/outbox
+.outbox
+
+# local agent instructions — do not commit
+CLAUDE.local.md

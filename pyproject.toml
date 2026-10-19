@@ -1,0 +1,98 @@
+[build-system]
+# 1.27 is the first hatchling that understands the PEP 639 `license` expression
+# and `license-files` used below; older ones emit legacy metadata instead.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ciqkit"
+dynamic = ["version"]
+description = "Developer tooling for Garmin Connect IQ watch apps: a simulator broker with priority scheduling, plus screen-layout and screenshot checks."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+authors = [{ name = "Johannes Hohenbichler" }]
+keywords = ["garmin", "connect-iq", "monkey-c", "simulator", "screenshots", "mcp"]
+# No `License ::` classifier on purpose: PEP 639 replaced it with the `license`
+# expression above, and PyPI rejects an upload that carries both.
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+
+# The core CLI (broker, leases, doctor) needs nothing but the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Everything needed to drive the simulator: capture, image processing, input.
+sim = ["Pillow>=10.0", "numpy>=1.24", "pyautogui>=0.9.54"]
+# Just the static checks (layout, shot-score, icon). No GUI, runs headless.
+checks = ["Pillow>=10.0", "numpy>=1.24"]
+# Sharper watch-face detection in the quality checker.
+cv = ["opencv-python-headless>=4.8"]
+# On-screen text verification: Apple Vision on macOS, the OCR engine built
+# into Windows 10/11 on Windows.
+ocr = ["ocrmac>=1.0; sys_platform == 'darwin'",
+       "winocr>=0.0.13; sys_platform == 'win32'"]
+dev = ["pytest>=8.0", "ruff>=0.6", "Pillow>=10.0", "numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/JohannesHoh/ciqkit"
+Source = "https://github.com/JohannesHoh/ciqkit"
+Issues = "https://github.com/JohannesHoh/ciqkit/issues"
+Changelog = "https://github.com/JohannesHoh/ciqkit/blob/main/CHANGELOG.md"
+
+[project.scripts]
+ciqkit = "ciqkit.cli:main"
+ciqkit-mcp = "ciqkit.sim.mcp_server:main"
+
+[tool.hatch.version]
+path = "src/ciqkit/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ciqkit"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/ciqkit/py.typed" = "ciqkit/py.typed"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "S"]
+ignore = [
+  "E501",    # long lines are handled by the formatter, not enforced here
+  "S101",    # asserts are fine in tests
+  "S603",    # subprocess calls are this tool's entire purpose
+  "S607",    # partial executable paths (git, osascript) are intentional
+  "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+# S110 (try/except/pass) is the intended shape in the code that drives a GUI we
+# do not control: dismissing a dialog that may not be there, re-binding a window
+# that may have moved, releasing a lease during teardown. Every one of these is
+# a best-effort step whose failure must not abort the capture in progress, and
+# each carries a comment saying so. Allowing it here keeps the rule meaningful
+# everywhere else.
+"src/ciqkit/capture/screenshot_utils.py" = ["S110"]
+"src/ciqkit/sim/broker.py" = ["S110"]
+"src/ciqkit/sim/session.py" = ["S110"]
+"src/ciqkit/sim/ocr.py" = ["S110"]
+"src/ciqkit/lease_cli.py" = ["S110"]

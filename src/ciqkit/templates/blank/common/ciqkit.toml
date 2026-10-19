@@ -1,0 +1,16 @@
+# ciqkit settings for this project. Schema: docs/config.md in the ciqkit repo.
+#
+# No [build] section: ciqkit uses its built-in build (monkeyc from your SDK,
+# your developer key, bin/{{DIR_NAME}}.prg, and bin/{{DIR_NAME}}-test.prg for
+# `ciqkit sim test`). Do not add a scripts/build.sh unless you want to replace it.
+
+[sim]
+device = "{{DEVICE}}"
+
+# Named screens: `ciqkit sim shots --all` regenerates every one of them.
+# Add one per screen you care about, with `steps` to reach it and an `anchor`
+# (text that must be on it).
+
+[[screens]]
+name   = "home"
+{{HOME_ANCHOR}}

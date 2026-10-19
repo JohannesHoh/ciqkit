@@ -1,0 +1,4 @@
+<drawables>
+    <!-- 40x40 for this device; drawn by art/make_icon.py. -->
+    <bitmap id="LauncherIcon" filename="launcher_icon.png"/>
+</drawables>

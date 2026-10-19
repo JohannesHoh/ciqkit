@@ -1,0 +1,5 @@
+# Everything under source/ is compiled, including source/tests/. The (:test)
+# functions there are dropped from a normal build and kept by `monkeyc -t`,
+# which is what `ciqkit sim test` builds. Do not add
+# `base.excludeAnnotations = test` here: it strips the tests even under -t.
+project.manifest = manifest.xml
