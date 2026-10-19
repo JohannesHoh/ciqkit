@@ -25,8 +25,10 @@ unusual, set `CIQ_HOME` to the SDK directory.
 You need Python 3.10 or newer (`python3 --version`).
 
 ```bash
-pip install "ciqkit[sim,ocr]"
+pip install "ciqkit[sim,ocr] @ git+https://github.com/JohannesHoh/ciqkit"
 ```
+
+(ciqkit is not on PyPI yet, which is why the command names its GitHub repo.)
 
 `sim` is what drives the simulator (screenshots, input). `ocr` lets ciqkit read
 the text on a screenshot, which is how it proves a screen is the one you wanted

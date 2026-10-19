@@ -22,8 +22,11 @@ Garmin's own tooling uses.
 ## 2. Install ciqkit
 
 ```bash
-pip install "ciqkit[sim]"
+pip install "ciqkit[sim] @ git+https://github.com/JohannesHoh/ciqkit"
 ```
+
+ciqkit is not on PyPI yet, so it installs from GitHub; add extras inside the
+brackets the same way. Once it is published, `pip install "ciqkit[sim]"` will do.
 
 | Extra | Pulls in | For |
 | --- | --- | --- |

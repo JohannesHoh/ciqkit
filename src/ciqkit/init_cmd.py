@@ -72,11 +72,11 @@ jobs:
   screens:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install "ciqkit[checks]"
+      - run: pip install "ciqkit[checks] @ git+https://github.com/JohannesHoh/ciqkit"
       - name: Layout and image quality of the baselines
         run: |
           if [ -d baselines ]; then

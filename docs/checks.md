@@ -121,7 +121,7 @@ ciqkit icon unique "$PROJECT_DIR" || exit 1
 ## In CI
 
 ```yaml
-- run: pip install "ciqkit[checks]"
+- run: pip install "ciqkit[checks] @ git+https://github.com/JohannesHoh/ciqkit"
 - run: ciqkit layout screenshots/ --fail-under 75
 - run: ciqkit shot-score screenshots/ --fail-under 70
 - run: ciqkit icon unique .

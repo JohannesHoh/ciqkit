@@ -10,7 +10,7 @@ Unofficial; not affiliated with Garmin ([TRADEMARKS.md](TRADEMARKS.md)).
 * **One simulator, many callers.** A broker queues scripts, test runs and agents with priorities and preemption instead of letting them collide.
 * **An agent can test its own watch app.** The same jobs as MCP tools (`ciqsim_*`), plus checks for content clipped by a round bezel.
 
-[Try the example](docs/tutorial/02-run-the-example.md) · [Install](#install) · [How it compares](#how-it-compares) · [Security](SECURITY.md) · [Apache-2.0](LICENSE) · Simulator: **macOS and Windows** · Linux: static checks and broker core
+[Try the example](docs/tutorial/02-run-the-example.md) · [Install](#install) · [How it compares](#how-it-compares) · [Security](SECURITY.md) · [Apache-2.0](LICENSE) · Simulator: **macOS and Windows** · Linux: no simulator control yet (static checks only)
 
 **Why not just `monkeydo`?** `monkeydo` pushes an app and returns at once, so a script that screenshots next often captures the watch face that was still showing, and two scripts on one simulator corrupt each other's run. ciqkit adds the waiting, the proof that the app loaded, and the queue; it calls the SDK's own tools underneath ([comparison](#how-it-compares)).
 
@@ -63,7 +63,7 @@ tool is the better pick:
 | --- | --- |
 | `ciqkit sim` | Screenshots (`shot`, and `shots --all` for the screens named in `ciqkit.toml`), time-sampled GIFs, scripted navigation and unit-test runs against the simulator, through a scheduling broker with priorities and preemption. Builds your app itself unless you configure a build. |
 | `ciqkit-mcp` | The same, exposed as [MCP](https://modelcontextprotocol.io) tools (`ciqsim_*`) so a coding agent can drive the simulator. |
-| `ciqkit new` | Starts a project from a template (`blank` app / watch face / data field, or the `tictactoe` example): fresh app id, manifest, unit-test skeleton, `ciqkit.toml`, `.mcp.json`, `CLAUDE.md`, and a developer key if you have none. See [docs/init.md](docs/init.md). |
+| `ciqkit new` | Starts a project from a template — `blank` (with `--type app`, `watchface` or `datafield`) or the `tictactoe` example: fresh app id, manifest, unit-test skeleton, `ciqkit.toml`, `.mcp.json`, `CLAUDE.md`, and a developer key if you have none. See [docs/init.md](docs/init.md). |
 | `ciqkit init` | Sets an existing project up for ciqkit: `ciqkit.toml`, MCP servers, a marked `CLAUDE.md` block, `.gitignore` entries, optional CI workflow. Dry run until you pass `--write`. See [docs/adopt.md](docs/adopt.md). |
 | `ciqkit keygen` | Creates the developer key the built-in build signs with. |
 | `ciqkit doctor` | Checks the environment; `--project DIR` also checks a project (manifest, devices, key, build route, tests). |
@@ -90,8 +90,8 @@ tool is the better pick:
   The terminal also needs **Screen Recording**, because captures are screen grabs.
 * **Windows:** Java on `PATH` (the SDK's own tools need it), and
   [Git for Windows](https://git-scm.com/download/win) if your build command is
-  a shell script — the default, `./scripts/build.sh`, is. ciqkit runs it with
-  Git's bash, never the WSL `bash.exe`. Gestures need an unlocked desktop;
+  a shell script (such as a project's `scripts/build.sh`). ciqkit runs it with
+  Git's bash, never the WSL `bash.exe`; the built-in build needs no bash. Gestures need an unlocked desktop;
   screenshots, recordings and test runs do not. See
   [docs/install.md](docs/install.md#3-windows).
 
@@ -102,18 +102,22 @@ Try it on the example app, four commands (macOS, SDK installed, see
 [note on what is not yet verified there](#platform-support)):
 
 ```bash
-pip install "ciqkit[sim,ocr]"
+pip install "ciqkit[sim,ocr] @ git+https://github.com/JohannesHoh/ciqkit"
 ciqkit new tictactoe --template tictactoe && cd tictactoe
 ciqkit doctor --project .
 ciqkit sim shots --all --native --out-dir shots   # first run starts the simulator
 ```
 
+ciqkit is not on PyPI yet, so it installs from GitHub. Once it is published,
+`pip install "ciqkit[sim,ocr]"` will do the same.
+
 Pick extras to taste:
 
 ```bash
-pip install "ciqkit[sim]"          # drive the simulator: capture + input
-pip install "ciqkit[sim,ocr]"      # + verify on-screen text (macOS + Windows)
-pip install "ciqkit[checks]"       # only the static checks, no GUI needed
+pip install "ciqkit[sim] @ git+https://github.com/JohannesHoh/ciqkit"          # drive the simulator: capture + input
+pip install "ciqkit[sim,ocr] @ git+https://github.com/JohannesHoh/ciqkit"      # + verify on-screen text (macOS + Windows)
+pip install "ciqkit[checks] @ git+https://github.com/JohannesHoh/ciqkit"       # only the static checks, no GUI needed
+pip install "ciqkit[sim,cv] @ git+https://github.com/JohannesHoh/ciqkit"       # + sharper watch-face detection in shot-score
 ```
 
 The static checks (`layout`, `shot-score`, `icon`) work on PNGs captured
@@ -140,8 +144,8 @@ From inside a Connect IQ project (a directory with a `manifest.xml`):
 # Capture one screen. Builds the project first unless you pass --prg.
 ciqkit sim shot home --out-dir ./screenshots
 
-# Assert the screen really says what you expect (exit 3 if it does not).
-# Needs an OCR backend: pip install "ciqkit[sim,ocr]"
+# Assert the screen really says what you expect (exit 3 if it does not;
+# `nav` and `shot-on` take --anchor the same way). Needs the `ocr` extra.
 ciqkit sim shot home --anchor "TOTAL" --out-dir ./screenshots
 
 # Use a build you already made, and skip building entirely.
@@ -172,9 +176,16 @@ still running and will still write its output. Pick it back up with
 
 ### Building
 
-With no `--prg`, ciqkit runs `./scripts/build.sh -d <device>` inside the project
-— i.e. **it executes a script from that directory**. If your project builds
-differently, set the command:
+With no `--prg`, ciqkit builds the project itself. It uses the first of:
+
+1. `CIQKIT_BUILD_CMD`
+2. `[build] cmd` in `ciqkit.toml`
+3. `./scripts/build.sh -d <device>`, if that file exists in the project —
+   i.e. **it executes a script from that directory**
+4. the built-in `monkeyc` build (needs `monkey.jungle` and your developer key;
+   `ciqkit keygen` makes one)
+
+`ciqkit doctor --project .` shows which route a project takes. To set the command:
 
 ```bash
 export CIQKIT_BUILD_CMD='monkeyc -o bin/MyApp.prg -d {device} -f monkey.jungle -y dev_key.der'
@@ -222,9 +233,10 @@ What "verified" means here:
   only covered by those tests, not run against a real simulator on Windows:
   `ciqkit new` / `init`, the built-in `monkeyc` build (no `scripts/build.sh`)
   and `ciqkit keygen`.
-* **Linux** runs the full test suite (broker core, leases, static checks) in
-  CI and was checked by hand in Debian containers (arm64, Python 3.10 and
-  3.13). Garmin ships a beta Linux SDK and simulator; what is missing is
+* **Linux** cannot drive the simulator. What runs there is the full test
+  suite (broker core, leases, static checks), in CI and by hand in Debian
+  containers (arm64, Python 3.10 and 3.13); no simulator was involved in
+  either. Garmin ships a beta Linux SDK and simulator; what is missing is
   ciqkit's side: driving it needs a Linux backend for finding, capturing and
   sending input to the simulator window (X11, or Xvfb for headless CI), and
   nobody has needed one yet. It is a well-bounded piece of work — the broker,
