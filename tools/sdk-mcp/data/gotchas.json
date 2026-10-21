@@ -870,5 +870,26 @@
     "codeWrong": "function draw(dc) {\n    var ds = System.getDeviceSettings();          // per row, per frame\n    var font = fitFont(dc, _name, chordAt(dc, d), fonts);\n    dc.drawText(x, y, font, _name, j);\n}",
     "codeCorrect": "function draw(dc) {\n    var key = dc.getWidth() * 10000 + dc.getHeight();\n    if (_plan == null || _planKey != key) { _plan = _layout(dc); _planKey = key; }\n    for (var i = 0; i < _plan.size(); i++) { /* setColor + drawText from _plan[i] */ }\n}",
     "source": "field use (a CustomMenu mode picker, profiled on-device vs. in the simulator)"
+  },
+  {
+    "id": "gotcha-056",
+    "title": "API since-levels are not checked at compile time: WatchUi.getCurrentView() and WatchUi.showToast() (3.4.0) crash older devices with Symbol Not Found",
+    "api": "WatchUi",
+    "tags": [
+      "api-availability",
+      "api-level",
+      "minApiLevel",
+      "feature-check",
+      "crash",
+      "getCurrentView",
+      "showToast",
+      "delegate"
+    ],
+    "severity": "high",
+    "wrong": "Calling an API newer than the oldest device in the manifest, e.g. WatchUi.getCurrentView() (since 3.4.0) in a BehaviorDelegate to find the view it pages, in an app whose minApiLevel is lower and whose manifest lists an API 3.3 device. monkeyc builds that device without an error or a warning about the call (checked with -w at type-check levels 0 to 2; level 3 fails on other strict-typing errors, none about the call), and unit tests and captures usually run on a current device, so it ships. On the old device the call dies with 'Symbol Not Found' the first time it runs.",
+    "correct": "Check each API's since-level against the oldest device in the manifest (that device's compiler.json, partNumbers[].connectIQVersion). For anything newer, guard it with a has-check (WatchUi has :showToast) or avoid it: hand a delegate its view through its constructor instead of looking the view up. Run the changed input or view path in the simulator on that oldest device too, not only on a current one.",
+    "codeWrong": "function onSelect() {\n    var view = WatchUi.getCurrentView()[0];   // API 3.4.0+\n    (view as HelpView).nextPage();\n    return true;\n}",
+    "codeCorrect": "function initialize(view as HelpView) { BehaviorDelegate.initialize(); _view = view; }\nfunction onSelect() { _view.nextPage(); WatchUi.requestUpdate(); return true; }\n// caller: var v = new HelpView(); WatchUi.pushView(v, new HelpDelegate(v), WatchUi.SLIDE_UP);\n// 3.4+ calls behind a has-check: if (WatchUi has :showToast) { WatchUi.showToast(msg, null); }",
+    "source": "Field use, 2026-10: two watch apps with minApiLevel 3.2.0 shared this help-screen delegate; on the fr945 (API 3.3.1) every page turn died with 'Symbol Not Found', reproduced in the Connect IQ simulator (SDK 9.1.0) for one of them. monkeyc -d fr945 -w built the unfixed code at -l 0, 1 and 2 with no mention of the call (-l 3 failed on unrelated strict-typing errors, none about it). SDK API docs: getCurrentView and showToast are since 3.4.0."
   }
 ]

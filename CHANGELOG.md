@@ -31,6 +31,9 @@ has, install from a clone (`pip install -e ".[sim]"`).
   by try/catch; about three concurrent `Timer.Timer`s per app; `requestUpdate()`
   from a covered view repaints the menu on top; `CustomMenuItem.draw()` runs per
   row per scroll frame.
+* Gotcha 056: monkeyc does not flag an API above the target device's level:
+  `WatchUi.getCurrentView()` (3.4.0, like `showToast()`) builds cleanly for an
+  API 3.3 device and dies there with Symbol Not Found.
 * CI rejects unknown keys in `gotchas.json`. Gotchas 049–051 carried their code
   samples under `wrongCode`/`correctCode`, which the server never rendered; they
   now use `codeWrong`/`codeCorrect`.
