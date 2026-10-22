@@ -88,3 +88,23 @@ def test_seeding_twice_without_restoring_is_refused(session, project):
     session.seed(str(project), {"SEED_N": "2"})
     with pytest.raises(SimError, match="already active"):
         session.seed(str(project), {"SEED_N": "3"})
+
+
+def test_two_patches_on_one_file_compose_and_restore(session, project):
+    """Each patch used to be computed from the untouched file, so the second one
+    on the same file silently dropped the first -- and a const seed plus a patch
+    on Constants.mc lost the seed the same way."""
+    app = project / "source" / "App.mc"
+    app.write_text("A();\nB();\n")
+    before = _constants(project)
+    session.seed(str(project), {"SEED_N": "7"}, [
+        {"file": "source/App.mc", "pattern": r"A\(\);", "repl": "A2();"},
+        {"file": "source/App.mc", "pattern": r"B\(\);", "repl": "B2();"},
+        {"file": "source/Constants.mc", "pattern": r"\"old\"", "repl": "\"new\""},
+    ])
+    assert app.read_text() == "A2();\nB2();\n"
+    assert "const SEED_N = 7;" in _constants(project)
+    assert 'const SEED_PATH = "new";' in _constants(project)
+    session.restore()
+    assert app.read_text() == "A();\nB();\n"
+    assert _constants(project) == before

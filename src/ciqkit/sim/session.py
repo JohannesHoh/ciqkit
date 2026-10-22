@@ -1707,11 +1707,15 @@ class SimSession:
         SIGKILLed broker is recoverable rather than merely detectable.
 
         Only one seed active at a time; every touched file is restored together.
+        Edits to the same file COMPOSE, in order: consts first, then each patch
+        on the text the previous edit left (two patches on one file used to be
+        computed from the original each, so the last one silently dropped the
+        others), and the file is backed up once, as it was before any of them.
         """
         if self._seed_backup is not None:
             raise SimError("a seed is already active; restore() first")
-        backups = []   # [(abs_path, original_bytes)]
-        edits = []     # [(abs_path, new_text)] — applied only once every check passed
+        backups = []   # [(abs_path, original_bytes)], one per file, first read
+        pending = {}   # abs_path -> text so far; written only once every check passed
         if consts:
             cpath = _seed_target(app_dir, os.path.join("source", "Constants.mc"))
             if not os.path.isfile(cpath):
@@ -1721,6 +1725,7 @@ class SimSession:
                 original = fh.read()
             backups.append((cpath, original))
             text = original.decode("utf-8")
+            pending[cpath] = text
             for name, value in consts.items():
                 pat = re.compile(rf"(const\s+{re.escape(name)}\s*=\s*)([^;]+)(;)")
                 if not pat.search(text):
@@ -1732,20 +1737,23 @@ class SimSession:
                 # raise. Seeds legitimately carry paths and escapes.
                 text = pat.sub(
                     lambda m, _v=value: m.group(1) + _v + m.group(3), text)
-            edits.append((cpath, text.encode("utf-8")))
+            pending[cpath] = text
         for p in (patches or []):
             fpath = _seed_target(app_dir, p["file"])
             if not os.path.isfile(fpath):
                 raise SimError(f"patch target not found: {p['file']}")
-            _refuse_if_dirty(fpath, force)
-            with open(fpath, "rb") as fh:
-                orig = fh.read()
-            backups.append((fpath, orig))
-            new_t, n = re.subn(p["pattern"], p["repl"], orig.decode("utf-8"),
+            if fpath not in pending:
+                _refuse_if_dirty(fpath, force)
+                with open(fpath, "rb") as fh:
+                    orig = fh.read()
+                backups.append((fpath, orig))
+                pending[fpath] = orig.decode("utf-8")
+            new_t, n = re.subn(p["pattern"], p["repl"], pending[fpath],
                                count=p.get("count", 1))
             if n == 0:
                 raise SimError(f"patch pattern not found in {p['file']}: {p['pattern']}")
-            edits.append((fpath, new_t.encode("utf-8")))
+            pending[fpath] = new_t
+        edits = [(path, text.encode("utf-8")) for path, text in pending.items()]
 
         # Every check has passed and nothing above this line touched the tree, so
         # a rejected seed can never half-apply. Journal the originals, then write.
