@@ -44,10 +44,13 @@ jobs:
     permissions:
       contents: read
       id-token: write   # trusted publishing (OIDC)
+      attestations: write   # build provenance
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
@@ -78,8 +81,14 @@ jobs:
           if [ -n "$hits" ]; then echo "::error::unexpected files in dist:"; echo "$hits"; exit 1; fi
           echo "clean"
 
+      # Verifiable with: gh attestation verify <file> -R JohannesHoh/ciqkit
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   npm:
     name: publish ciqkit-sdk-mcp to npm
@@ -88,13 +97,16 @@ jobs:
     permissions:
       contents: read
       id-token: write   # npm provenance attestation
+      attestations: write   # build provenance
     defaults:
       run:
         working-directory: tools/sdk-mcp
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -122,6 +134,18 @@ jobs:
             for (const need of ['dist/index.js', 'dist/parse-sdk.js', 'data/gotchas.json', 'LICENSE']) {
               if (!f.includes(need)) throw new Error('missing ' + need);
             }"
+
+      # Same clean build prepublishOnly runs, packed once so the tarball can be attested.
+      - name: Pack tarball for attestation
+        run: |
+          npm run clean && npm run build
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+
+      # Verifiable with: gh attestation verify <file> -R JohannesHoh/ciqkit
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/pack/*.tgz
 
       - name: Publish (prepublishOnly rebuilds)
         run: npm publish --provenance --access public
