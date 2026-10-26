@@ -135,10 +135,11 @@ jobs:
               if (!f.includes(need)) throw new Error('missing ' + need);
             }"
 
-      # Same clean build prepublishOnly runs, packed once so the tarball can be attested.
+      # Clean build, then packed once: this exact tarball is attested AND published.
       - name: Pack tarball for attestation
         run: |
           npm run clean && npm run build
+          mkdir -p "$RUNNER_TEMP/pack"
           npm pack --pack-destination "$RUNNER_TEMP/pack"
 
       # Verifiable with: gh attestation verify <file> -R JohannesHoh/ciqkit
@@ -147,7 +148,8 @@ jobs:
         with:
           subject-path: ${{ runner.temp }}/pack/*.tgz
 
-      - name: Publish (prepublishOnly rebuilds)
-        run: npm publish --provenance --access public
+      # A tarball spec skips prepublishOnly, so the attested bytes ship unchanged.
+      - name: Publish the attested tarball
+        run: npm publish "$RUNNER_TEMP"/pack/*.tgz --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -73,7 +73,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      - run: npm install
+      - run: npm ci
 
       - name: Typecheck and build
         run: npm run build
