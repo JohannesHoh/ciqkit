@@ -22,7 +22,7 @@ unusual, set `CIQ_HOME` to the SDK directory.
 
 ## Python and ciqkit
 
-You need Python 3.10 or newer (`python3 --version`).
+You need Python 3.11 or newer (`python3 --version`).
 
 ```bash
 pip install "ciqkit[sim,ocr] @ git+https://github.com/JohannesHoh/ciqkit"
@@ -74,7 +74,7 @@ what it flags before going on; the troubleshooting list in
 
 ## What you learned
 
-* ciqkit needs Garmin's SDK, installed by you, plus Python 3.10+.
+* ciqkit needs Garmin's SDK, installed by you, plus Python 3.11+.
 * The terminal needs Accessibility and Screen Recording permission.
 * `ciqkit keygen` makes your signing key and `ciqkit doctor` checks the setup.
 

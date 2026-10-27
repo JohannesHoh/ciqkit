@@ -257,7 +257,7 @@ def _sha256(path: str) -> str:
 
 
 def _now_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _git_info(path: str | None) -> dict:
@@ -435,7 +435,7 @@ def snapshot(prg: str, *, kind: str, app: str | None = None,
     if name is None:
         name, how = resolve_name(prg)
     src = sim_apps_dir()
-    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
     sid = f"{stamp}-{re.sub(r'[^a-z0-9_-]', '', kind.lower()) or 'run'}-{os.getpid()}"
     with _JournalLock():
         d = os.path.join(_app_dir(name), sid)

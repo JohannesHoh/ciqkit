@@ -470,6 +470,8 @@ release, not by review:
 * On a platform without POSIX uids, the private runtime directory now raises a
   named error explaining that the broker and leases are POSIX-only, instead of
   an `AttributeError` on `os.getuid` from deep in the call stack.
+* Requires **Python 3.11+**. 3.10 reached end of life on 2026-10-01, and
+  Pillow 13 (below) no longer supports it.
 
 ### Removed
 
@@ -498,6 +500,11 @@ release, not by review:
   now raises instead of being written: `os.path.join(app_dir, file)` is not a
   containment check, and seeds are submittable over the control socket and by
   an MCP client.
+* Dependency minimums raised past known advisories: Pillow 13.0,
+  opencv-python-headless 4.8.1.78, pytest 9.0.3 (dev only). The sdk-mcp
+  lockfile moves body-parser, fast-uri, proxy-addr, undici, hono and
+  ip-address to fixed versions; the server runs over stdio only, so none of
+  their HTTP paths was reachable.
 * Seeding refuses a file with uncommitted git changes unless forced, and the
   originals are journalled to disk before any write, so a `kill -9` mid-seed is
   recoverable rather than merely detectable. Recovery is digest-guarded and

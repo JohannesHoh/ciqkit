@@ -29,7 +29,7 @@ place you stall.
    literally:
    * install Garmin's SDK Manager, sign in, download the newest SDK and the
      devices venu3, fr255 and venusq2; start the simulator once and quit it;
-   * install Python 3.10+ (python.org installer or Homebrew);
+   * install Python 3.11+ (python.org installer or Homebrew);
    * install ciqkit **from the wheel**, not from PyPI and not editable:
      `pipx install "/path/ciqkit-0.1.0-py3-none-any.whl[sim,ocr]"` (or a
      venv plus `pip install "/path/…whl[sim,ocr]"`);
@@ -115,8 +115,8 @@ On the **public** repository (see E for which one that is):
   request, require status checks to pass, block force pushes and deletion.
   Required checks (job names from `ci.yml`; they appear once CI has run on
   the repo):
-  `python 3.10 (ubuntu-latest)`, `python 3.13 (ubuntu-latest)`,
-  `python 3.10 (macos-latest)`, `python 3.13 (macos-latest)`,
+  `python 3.11 (ubuntu-latest)`, `python 3.13 (ubuntu-latest)`,
+  `python 3.11 (macos-latest)`, `python 3.13 (macos-latest)`,
   `sdk-mcp (node 18)`, `sdk-mcp (node 22)`,
   `no redistributed Garmin material`.
 * **Actions → General**: workflow permissions "Read repository contents"

@@ -11,7 +11,7 @@ description = "Developer tooling for Garmin Connect IQ watch apps: a simulator b
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Johannes Hohenbichler" }]
 keywords = ["garmin", "connect-iq", "monkey-c", "simulator", "screenshots", "mcp"]
 # No `License ::` classifier on purpose: PEP 639 replaced it with the `license`
@@ -24,7 +24,6 @@ classifiers = [
   "Operating System :: Microsoft :: Windows :: Windows 10",
   "Operating System :: Microsoft :: Windows :: Windows 11",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -36,16 +35,16 @@ dependencies = []
 
 [project.optional-dependencies]
 # Everything needed to drive the simulator: capture, image processing, input.
-sim = ["Pillow>=10.0", "numpy>=1.24", "pyautogui>=0.9.54"]
+sim = ["Pillow>=13.0", "numpy>=1.24", "pyautogui>=0.9.54"]
 # Just the static checks (layout, shot-score, icon). No GUI, runs headless.
-checks = ["Pillow>=10.0", "numpy>=1.24"]
+checks = ["Pillow>=13.0", "numpy>=1.24"]
 # Sharper watch-face detection in the quality checker.
-cv = ["opencv-python-headless>=4.8"]
+cv = ["opencv-python-headless>=4.8.1.78"]
 # On-screen text verification: Apple Vision on macOS, the OCR engine built
 # into Windows 10/11 on Windows.
 ocr = ["ocrmac>=1.0; sys_platform == 'darwin'",
        "winocr>=0.0.13; sys_platform == 'win32'"]
-dev = ["pytest>=8.0", "ruff>=0.6", "Pillow>=10.0", "numpy>=1.24"]
+dev = ["pytest>=9.0.3", "ruff>=0.6", "Pillow>=13.0", "numpy>=1.24"]
 
 [project.urls]
 Homepage = "https://github.com/JohannesHoh/ciqkit"

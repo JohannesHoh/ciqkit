@@ -29,7 +29,7 @@ cd tools/sdk-mcp && npm install && npm run build   # must typecheck clean
 npm run parse-sdk                                  # needs a local Connect IQ SDK
 ```
 
-CI (`.github/workflows/ci.yml`) runs pytest + ruff on Linux, macOS and Windows × py3.10/3.13,
+CI (`.github/workflows/ci.yml`) runs pytest + ruff on Linux, macOS and Windows × py3.11/3.13,
 builds the Node server, validates `data/gotchas.json`, and enforces that **no
 Garmin-derived material is ever committed** (`sdk-index.json`, `.iq/.prg/.der/.jks`).
 

@@ -80,7 +80,7 @@ tool is the better pick:
 
 * **macOS or Windows 10/11** — the platforms ciqkit can drive the simulator
   on. See [Platform support](#platform-support).
-* **Python 3.10+**
+* **Python 3.11+**
 * **The Connect IQ SDK**, installed yourself via Garmin's
   [SDK Manager](https://developer.garmin.com/connect-iq/sdk/). ciqkit ships no
   Garmin files and cannot install it for you.
@@ -229,7 +229,7 @@ What "verified" means here:
   SDK 8.4.1): `doctor`, shots, recordings, test runs, OCR anchors, leases,
   storage, the MCP server, `tools/sdk-mcp`, and keys, taps, swipes and holds
   through the background broker. The full test suite runs in CI on
-  `windows-latest` (Python 3.10 and 3.13). Added after that pass and so far
+  `windows-latest` (Python 3.11 and 3.13). Added after that pass and so far
   only covered by those tests, not run against a real simulator on Windows:
   `ciqkit new` / `init`, the built-in `monkeyc` build (no `scripts/build.sh`)
   and `ciqkit keygen`.
