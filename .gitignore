@@ -33,6 +33,10 @@ Thumbs.db
 /screenshots/
 *.prg
 *.iq
+# The example's own bin/ is ignored by examples/tictactoe/.gitignore, but hatch
+# builds the sdist from this root file only: without this line a local
+# `python -m build` packs monkeyc output carrying absolute home-dir paths.
+examples/*/bin/
 
 # --- Signing keys: never commit --------------------------------------------
 # CI rejects these outright (see the no-garmin-material job); ignoring them here
