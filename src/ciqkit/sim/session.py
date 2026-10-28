@@ -986,10 +986,6 @@ class SimSession:
                           "esc": "esc", "escape": "esc"}
     HOLD_S = 1.6
 
-    def _device_id(self):
-        cur = getattr(self, "current", None)
-        return cur[1] if cur else None
-
     def close_aux(self) -> dict:
         """Close every simulator window except the device window (and alert
         dialogs, which dismiss_modal_dialogs owns)."""
