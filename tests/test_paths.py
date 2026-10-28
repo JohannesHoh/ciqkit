@@ -143,3 +143,75 @@ def test_a_directory_owned_by_someone_else_is_refused(monkeypatch):
     monkeypatch.setattr(_winapi, "owned_by_me", lambda p: (False, "S-1-5-21-0-0-0-1002"))
     with pytest.raises(paths.InsecureRuntimeDir, match="owned by"):
         paths._ensure_private(d)
+
+
+class _FakeWinapi:
+    """Stands in for ciqkit._winapi so the Windows half of the runtime-dir
+    check runs on every CI platform, not only where the real DACL calls do.
+    Records what was made private, and can be told to deny ownership or to
+    fail the DACL write."""
+
+    def __init__(self, mine=True, make_private_error=None):
+        self.mine = mine
+        self.make_private_error = make_private_error
+        self.made_private = []
+
+    def owned_by_me(self, path):
+        return self.mine, "S-1-5-21-0-0-0-1002"
+
+    def user_sid(self):
+        return "S-1-5-21-0-0-0-1001"
+
+    def make_private(self, path):
+        if self.make_private_error:
+            raise self.make_private_error
+        self.made_private.append(path)
+
+
+@pytest.fixture
+def fake_winapi(monkeypatch):
+    import ciqkit
+
+    def install(**kw):
+        fake = _FakeWinapi(**kw)
+        # `from . import _winapi` reads the package attribute first.
+        monkeypatch.setitem(sys.modules, "ciqkit._winapi", fake)
+        monkeypatch.setattr(ciqkit, "_winapi", fake, raising=False)
+        return fake
+    return install
+
+
+def test_windows_check_rewrites_the_dacl_of_an_owned_directory(tmp_path, fake_winapi):
+    """Rewritten on every call, so a directory loosened by hand is put back."""
+    fake = fake_winapi()
+    d = str(tmp_path)
+    assert paths._ensure_private_windows(d) == d
+    assert paths._ensure_private_windows(d) == d
+    assert fake.made_private == [d, d]
+
+
+def test_windows_check_refuses_a_file_in_place_of_the_directory(tmp_path, fake_winapi):
+    fake = fake_winapi()
+    f = tmp_path / "runtime"
+    f.write_bytes(b"")
+    with pytest.raises(paths.InsecureRuntimeDir, match="not a plain directory"):
+        paths._ensure_private_windows(str(f))
+    assert fake.made_private == []
+
+
+def test_windows_check_refuses_a_foreign_owner_before_touching_the_dacl(
+        tmp_path, fake_winapi):
+    """Rewriting someone else's DACL would hand their directory to us; refuse."""
+    fake = fake_winapi(mine=False)
+    with pytest.raises(paths.InsecureRuntimeDir, match="owned by S-1-5-21-0-0-0-1002"):
+        paths._ensure_private_windows(str(tmp_path))
+    assert fake.made_private == []
+
+
+def test_windows_check_fails_closed_when_the_dacl_cannot_be_written(
+        tmp_path, fake_winapi):
+    """An unrestricted directory must not hold the control channel."""
+    fake_winapi(make_private_error=PermissionError(5, "Access is denied"))
+    with pytest.raises(paths.InsecureRuntimeDir, match="could not be restricted") as ei:
+        paths._ensure_private_windows(str(tmp_path))
+    assert isinstance(ei.value.__cause__, PermissionError)
