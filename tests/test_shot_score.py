@@ -131,3 +131,108 @@ def test_json_output_stays_parseable_when_there_is_nothing_to_score(tmp_path,
 def test_a_real_directory_still_scores_and_passes(tmp_path, capsys):
     _watch_face(454).save(tmp_path / "home.png")
     assert shot_score.main([str(tmp_path), "--fail-under", "1"]) == 0
+
+
+# --- Framed store shots -----------------------------------------------------
+#
+# The watch-body check has two detectors of very different quality, and the
+# severity of a miss must follow which one ran: a Hough miss is a real
+# failure, a miss by the brittle no-OpenCV fallback is only a warning.
+
+def _framed(bg=tuple(int(c) for c in shot_score.STORE_BG)):
+    img = Image.new("RGB", (1080, 1080), bg)
+    img.paste(_watch_face(454), (313, 313))
+    return img
+
+
+def _fake_cv2(circles):
+    import types
+    import numpy as np
+    return types.SimpleNamespace(
+        HOUGH_GRADIENT=3,
+        HoughCircles=lambda *a, **k: None if circles is None
+        else np.array([circles], dtype=np.float32),
+    )
+
+
+def _assess_framed(tmp_path, monkeypatch, *, cv2, bg=None):
+    if cv2 is None:
+        monkeypatch.setattr(shot_score, "HAS_CV2", False)
+    else:
+        monkeypatch.setattr(shot_score, "HAS_CV2", True)
+        monkeypatch.setattr(shot_score, "cv2", cv2, raising=False)
+        # The stub only speaks HoughCircles; sharpness is not under test.
+        monkeypatch.setattr(shot_score, "_laplacian_variance", lambda g: 500.0)
+    p = tmp_path / "framed.png"
+    (_framed() if bg is None else _framed(bg)).save(p)
+    r = shot_score.assess(p)
+    assert r.matched_kind == "framed"
+    return r
+
+
+def test_a_fallback_miss_on_a_framed_shot_only_warns(tmp_path, monkeypatch):
+    r = _assess_framed(tmp_path, monkeypatch, cv2=None)
+    body = {f.code: f.severity for f in r.findings if "watch_body" in f.code}
+    assert body == {"watch_body_unverified": shot_score.SEVERITY_WARN}
+
+
+def test_a_hough_miss_on_a_framed_shot_fails(tmp_path, monkeypatch):
+    r = _assess_framed(tmp_path, monkeypatch, cv2=_fake_cv2(None))
+    body = {f.code: f.severity for f in r.findings if "watch_body" in f.code}
+    assert body == {"no_watch_body_detected": shot_score.SEVERITY_FAIL}
+
+
+def test_a_centred_watch_body_is_reported_not_flagged(tmp_path, monkeypatch):
+    r = _assess_framed(tmp_path, monkeypatch, cv2=_fake_cv2([[540, 540, 227]]))
+    assert r.metrics["watch_circle"]["centeredness"] == 1.0
+    assert not {"watch_off_centre", "no_watch_body_detected"} & _codes(r)
+
+
+def test_the_most_centred_circle_wins_and_off_centre_warns(tmp_path, monkeypatch):
+    # Hough's first candidate is not its best one: selection is by centredness.
+    r = _assess_framed(tmp_path, monkeypatch,
+                       cv2=_fake_cv2([[900, 900, 200], [700, 700, 227]]))
+    assert r.metrics["watch_circle"]["cx"] == 700.0
+    assert "watch_off_centre" in _codes(r)
+
+
+def test_a_framed_shot_off_the_store_background_warns(tmp_path, monkeypatch):
+    on_bg = _assess_framed(tmp_path, monkeypatch, cv2=None)
+    assert "framed_bg_off" not in _codes(on_bg)
+    off_bg = _assess_framed(tmp_path, monkeypatch, cv2=None, bg=(200, 200, 200))
+    assert "framed_bg_off" in _codes(off_bg)
+
+
+def test_the_fallback_detector_finds_a_dark_centre_on_light_corners(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(shot_score, "HAS_CV2", False)
+    gray = np.full((400, 400), 200.0)
+    yy, xx = np.ogrid[:400, :400]
+    gray[(xx - 200) ** 2 + (yy - 200) ** 2 <= 150 ** 2] = 20.0
+    assert shot_score._detect_central_dark_circle(gray)["centeredness"] == 1.0
+    assert shot_score._detect_central_dark_circle(np.full((400, 400), 90.0)) is None
+
+
+# --- Icons and covers -------------------------------------------------------
+
+def test_a_solid_icon_fails(tmp_path):
+    p = tmp_path / "icon.png"
+    Image.new("RGB", (128, 128), (40, 90, 200)).save(p)
+    r = shot_score.assess(p)
+    assert r.matched_kind == "icon"
+    assert "icon_blank_or_solid" in _codes(r)
+
+
+def test_a_flat_cover_warns_and_a_decorated_one_does_not(tmp_path):
+    flat = tmp_path / "flat.png"
+    Image.new("RGB", (500, 500), (30, 30, 30)).save(flat)
+    assert "cover_too_flat" in _codes(shot_score.assess(flat))
+
+    busy = Image.new("RGB", (500, 500))
+    busy.putdata([((x * 7) % 256, (y * 5) % 256, ((x + y) * 3) % 256)
+                  for y in range(500) for x in range(500)])
+    p = tmp_path / "busy.png"
+    busy.save(p)
+    r = shot_score.assess(p)
+    assert r.matched_kind == "cover"
+    assert "cover_too_flat" not in _codes(r)
