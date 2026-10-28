@@ -34,9 +34,11 @@ from ..paths import default_out_dir
 from . import console
 from . import ocr
 from . import preflight
-from . import seedjournal
+from . import recording as _recording
+from . import seed as _seed
 from . import simport
 from . import storage
+from .errors import SimError
 from .preflight import detect_sdk
 from .protocol import DEFAULT_PLAYBACK_MS as _DEFAULT_PLAYBACK_MS
 from .protocol import DEFAULT_SHOT_SETTLE_S, button_id, swipe_spec
@@ -70,10 +72,6 @@ def _with_dismissed(fn):
                 r["simulator_crashed"] = True
         return r
     return wrapper
-
-
-class SimError(RuntimeError):
-    pass
 
 
 # Where build scripts in the wild drop their .prg, searched in this order when
@@ -1527,7 +1525,7 @@ class SimSession:
         frames = []   # (PIL.Image transformed, t_captured)
         # Gaps that are OUR bookkeeping, not the app standing still: the one
         # after frame 0 (which also pays for building the canvas mask) and the
-        # one before every re-raised frame. See _flatten_overhead_gaps.
+        # one before every re-raised frame. See recording._flatten_overhead_gaps.
         overhead_gaps = set()
         box = None
         geom = None          # framing geometry, detected once on frame 0
@@ -1611,21 +1609,8 @@ class SimSession:
         gif_path = os.path.join(od, f"{name}.gif")
         # Frame durations from the real timestamps, then time-compressed so the
         # clip actually animates (see the docstring).
-        wall = []
-        for i in range(len(frames) - 1):
-            wall.append(max(20, int((frames[i + 1][1] - frames[i][1]) * 1000)))
-        # Flatten BEFORE extending the track, so the final frame cannot inherit
-        # a raw overhead gap: overhead_gaps indexes real deltas, and a tail that
-        # copied wall[-1] first would keep the un-flattened value if that last
-        # delta happened to be a refocus (it is, whenever the clip ends just
-        # after one) -- which is exactly how a 1.4 s freeze survived on the
-        # final frame of a measured clip.
-        wall = _flatten_overhead_gaps(wall, overhead_gaps)
-        # The last frame has no successor to time it: reuse the previous real
-        # delta rather than the requested interval, which is a floor the grab
-        # never reaches and would flash the final frame past in a few ms.
-        wall.append(wall[-1] if wall else interval_ms)
-        durations, speedup = _compress_durations(wall, playback_ms)
+        durations, speedup = _recording.gif_durations(
+            [f[1] for f in frames], overhead_gaps, interval_ms, playback_ms)
         imgs = [f[0] for f in frames]
         imgs[0].save(gif_path, save_all=True, append_images=imgs[1:],
                      duration=durations, loop=0, optimize=True)
@@ -1638,7 +1623,7 @@ class SimSession:
                 im.save(os.path.join(frames_dir, f"{i:03d}.png"))
 
         sheet_path = os.path.join(od, f"{name}.sheet.png")
-        self._contact_sheet(imgs, sheet_path, cols=sheet_cols)
+        _recording._contact_sheet(imgs, sheet_path, cols=sheet_cols)
 
         elapsed = frames[-1][1] - frames[0][1]
         fps = (len(frames) - 1) / elapsed if elapsed > 0 else 0.0
@@ -1649,31 +1634,6 @@ class SimSession:
                 "gif_duration_s": round(sum(durations) / 1000.0, 2),
                 "playback_speedup": round(speedup, 1),
                 "truncated": truncated}
-
-    @staticmethod
-    def _contact_sheet(imgs, path: str, cols: int = 6, tile_w: int = 227):
-        """Grid montage of every frame (row-major, numbered), for frame-by-frame
-        review. Tiles are downscaled to tile_w so a 40-frame clip stays a
-        readable, reasonably-sized single PNG."""
-        from PIL import Image, ImageDraw
-        if not imgs:
-            return
-        # Never pad out to the full grid width: captures are slow, so a short
-        # clip is often 1-2 frames, and a fixed 6-wide grid renders those as one
-        # thumbnail beside five empty cells that look like failed captures.
-        cols = max(1, min(cols, len(imgs)))
-        w, h = imgs[0].size
-        scale = tile_w / float(w)
-        tw, th = tile_w, max(1, int(h * scale))
-        rows = (len(imgs) + cols - 1) // cols
-        sheet = Image.new("RGB", (cols * tw, rows * th), (24, 24, 24))
-        draw = ImageDraw.Draw(sheet)
-        for i, im in enumerate(imgs):
-            tile = im.resize((tw, th))
-            x, y = (i % cols) * tw, (i // cols) * th
-            sheet.paste(tile, (x, y))
-            draw.text((x + 4, y + 2), str(i), fill=(255, 235, 59))
-        sheet.save(path)
 
     # ── SEED_* seeding with guaranteed restore + git-clean guard ────────────────
     def seed(self, app_dir: str, consts: dict = None, patches: list = None,
@@ -1710,92 +1670,17 @@ class SimSession:
         """
         if self._seed_backup is not None:
             raise SimError("a seed is already active; restore() first")
-        backups = []   # [(abs_path, original_bytes)], one per file, first read
-        pending = {}   # abs_path -> text so far; written only once every check passed
-        if consts:
-            cpath = _seed_target(app_dir, os.path.join("source", "Constants.mc"))
-            if not os.path.isfile(cpath):
-                raise SimError(f"no Constants.mc at {cpath}")
-            _refuse_if_dirty(cpath, force)
-            with open(cpath, "rb") as fh:
-                original = fh.read()
-            backups.append((cpath, original))
-            text = original.decode("utf-8")
-            pending[cpath] = text
-            for name, value in consts.items():
-                pat = re.compile(rf"(const\s+{re.escape(name)}\s*=\s*)([^;]+)(;)")
-                if not pat.search(text):
-                    raise SimError(f"const {name} not found in Constants.mc")
-                # A function replacement, NOT an f-string template: in a
-                # template, backslashes in the value are read as regular
-                # expression escapes, so a value of `"\1"` would splice the
-                # matched text back into the user's source and `"a\g"` would
-                # raise. Seeds legitimately carry paths and escapes.
-                text = pat.sub(
-                    lambda m, _v=value: m.group(1) + _v + m.group(3), text)
-            pending[cpath] = text
-        for p in (patches or []):
-            fpath = _seed_target(app_dir, p["file"])
-            if not os.path.isfile(fpath):
-                raise SimError(f"patch target not found: {p['file']}")
-            if fpath not in pending:
-                _refuse_if_dirty(fpath, force)
-                with open(fpath, "rb") as fh:
-                    orig = fh.read()
-                backups.append((fpath, orig))
-                pending[fpath] = orig.decode("utf-8")
-            new_t, n = re.subn(p["pattern"], p["repl"], pending[fpath],
-                               count=p.get("count", 1))
-            if n == 0:
-                raise SimError(f"patch pattern not found in {p['file']}: {p['pattern']}")
-            pending[fpath] = new_t
-        edits = [(path, text.encode("utf-8")) for path, text in pending.items()]
-
-        # Every check has passed and nothing above this line touched the tree, so
-        # a rejected seed can never half-apply. Journal the originals, then write.
-        #
-        # Writes are binary on purpose: the source was decoded as UTF-8, so it is
-        # encoded back the same way rather than in whatever the locale happens to
-        # be, and text mode on Windows would rewrite every newline. It also makes
-        # the bytes on disk exactly what the journal hashed.
-        originals = dict(backups)
-        try:
-            seedjournal.record([(p, originals[p], new) for p, new in edits])
-        except OSError as exc:
-            # Crash recovery is a safety net, not a precondition — but say so.
-            log.warning("could not write the seed journal (%s); a SIGKILL during "
-                        "this job would leave the patch in your tree", exc)
-        try:
-            for path, new_bytes in edits:
-                with open(path, "wb") as fh:
-                    fh.write(new_bytes)
-        except Exception:
-            # A failed write mid-batch — roll every touched file back.
-            for path, orig in backups:
-                with open(path, "wb") as fh:
-                    fh.write(orig)
-            seedjournal.clear()
-            raise
-        self._seed_backup = backups
-        return {"ok": True,
-                "seeded_consts": list((consts or {}).keys()),
-                "patched_files": [os.path.basename(f) for f, _ in backups
-                                  if not f.endswith("Constants.mc")]}
+        self._seed_backup, result = _seed.apply(app_dir, consts, patches, force)
+        return result
 
     def restore(self) -> dict:
         """Put every seeded file back byte-exact and assert git sees no change
         (never leave SEED_*=true or a stray source patch). Idempotent."""
         if self._seed_backup is None:
             return {"ok": True, "noop": True}
-        restored, clean = [], True
-        for path, original in self._seed_backup:
-            with open(path, "wb") as fh:
-                fh.write(original)
-            restored.append(path)
-            clean = clean and _git_clean(path)
+        result = _seed.restore(self._seed_backup)
         self._seed_backup = None
-        seedjournal.clear()
-        return {"ok": True, "restored": restored, "git_clean": clean}
+        return result
 
     # ── tests ───────────────────────────────────────────────────────────────────
     TEST_RETRY_SETTLE_S = 3.0
@@ -1839,7 +1724,7 @@ class SimSession:
             except subprocess.TimeoutExpired as e:
                 return {"ok": False, "reason": "timeout",
                         "out": (e.output or "")[-2000:] if isinstance(e.output, str) else ""}
-            res = _parse_test_output(out)
+            res = _recording._parse_test_output(out)
             if res.get("reason") != "simulator-unreachable" or attempt == 2:
                 break
             log.warning("monkeydo could not connect on the first test run; retrying once")
@@ -1884,153 +1769,3 @@ def _safe(fn, *a):
         return fn(*a)
     except Exception:
         return None
-
-
-def _seed_target(app_dir: str, rel: str) -> str:
-    """Resolve a seed target inside ``app_dir``, refusing anything that escapes.
-
-    ``os.path.join(app_dir, rel)`` is not a containment check: an absolute
-    ``rel`` discards ``app_dir`` entirely, and ``../`` walks out of it. Seeding
-    is reachable from the broker socket and from the MCP server, so an unchecked
-    join is a write primitive for every file the user owns. Symlinks are
-    resolved first, so a link inside the project cannot point out of it either.
-    """
-    root = os.path.realpath(app_dir)
-    full = os.path.realpath(os.path.join(root, rel))
-    if full != root and not full.startswith(root + os.sep):
-        raise SimError(
-            f"refusing to patch {rel!r}: it resolves to {full}, outside the "
-            f"project directory {root}. Seed targets must be inside the project.")
-    return full
-
-
-def _git_status(path: str) -> str:
-    """'clean' | 'dirty' | 'untracked' | 'no-git' for one file."""
-    d = os.path.dirname(path) or "."
-    try:
-        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "--", path],
-                                 cwd=d, capture_output=True)
-        if tracked.returncode != 0:
-            inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                                    cwd=d, capture_output=True)
-            return "untracked" if inside.returncode == 0 else "no-git"
-        r = subprocess.run(["git", "diff", "--quiet", "--", path],
-                           cwd=d, capture_output=True)
-        return "clean" if r.returncode == 0 else "dirty"
-    except OSError:
-        return "no-git"   # git is not installed; the journal still covers us
-
-
-def _refuse_if_dirty(path: str, force: bool) -> None:
-    """Do not patch a file whose uncommitted changes we could not give back.
-
-    Restore is byte-exact and runs on every observable exit, but a SIGKILL
-    leaves the patch behind. If the file was committed, that is a
-    `git checkout` away; if it held uncommitted work, the journal is the only
-    copy. Refusing by default keeps the worst case boring.
-    """
-    if force:
-        return
-    if _git_status(path) == "dirty":
-        raise SimError(
-            f"{path} has uncommitted changes. Seeding rewrites it and restores "
-            f"it afterwards, but a SIGKILL mid-job would leave the patch in "
-            f"place with your edits only in ciqkit's journal. Commit or stash "
-            f"first, or pass force to seed anyway.")
-
-
-def _git_clean(path: str) -> bool:
-    return _git_status(path) in ("clean", "untracked", "no-git")
-
-
-def _flatten_overhead_gaps(wall_ms: list[int], overhead: set[int]) -> list[int]:
-    """Replace frame durations that measure ciqkit, not the app.
-
-    Frame durations come from the real capture timestamps so that a genuine
-    pause on the watch still reads as a pause. But two of the gaps in a clip
-    are not the watch pausing -- they are this module doing bookkeeping between
-    two grabs: the ~0.5 s canvas-mask build after frame 0, and the ~1.05 s
-    window re-raise before every `refocus_every`-th frame.
-
-    At the old ~0.5 fps those hid inside a two-second frame time. At ~4.6 fps
-    they do not: measured on a real clip, the refocus frame held for 1450 ms
-    against a 170 ms median -- a 8x freeze punched into the playback every
-    ~5 s, in a clip whose whole point is watching motion. `_compress_durations`
-    cannot help, because a healthy clip is already faster than `playback_ms`
-    and passes through untouched, and its [20, 1000] ms clamp only applies on
-    the branch that scales.
-
-    So flatten these gaps to the median of the honest ones. That is not a lie
-    about the app: nothing happened on the watch during a window raise that the
-    neighbouring frames do not already show. Real stalls -- a slow redraw, a
-    blocking dialog -- are untouched and still read as stalls.
-    """
-    honest = [d for i, d in enumerate(wall_ms) if i not in overhead]
-    if not honest or len(honest) == len(wall_ms):
-        return list(wall_ms)
-    ordered = sorted(honest)
-    mid = len(ordered) // 2
-    median = int(ordered[mid] if len(ordered) % 2
-                 else (ordered[mid - 1] + ordered[mid]) / 2.0)
-    # Only ever SHORTEN an overhead gap. If a gap we flagged came in under the
-    # median anyway, the bookkeeping evidently cost nothing and stretching it
-    # out to the median would invent a pause that never happened.
-    return [min(d, median) if i in overhead else d
-            for i, d in enumerate(wall_ms)]
-
-
-def _compress_durations(wall_ms: list[int], playback_ms: int) -> tuple[list[int], float]:
-    """Scale wall-clock frame durations into a playable GIF timing track.
-
-    Keeps the RATIOS between frames (so a real pause still reads as a pause) but
-    scales the whole track so the MEDIAN frame lasts `playback_ms`. Median, not
-    mean, so one slow grab does not drag every other frame down with it.
-    `playback_ms <= 0` returns the wall-clock track untouched.
-
-    Frames are clamped to [20, 1000] ms: under 20 ms most viewers silently
-    substitute 100 ms, and a single outlier over 1 s looks like the clip froze.
-    """
-    if playback_ms <= 0 or not wall_ms:
-        return list(wall_ms), 1.0
-    ordered = sorted(wall_ms)
-    mid = len(ordered) // 2
-    median = (ordered[mid] if len(ordered) % 2
-              else (ordered[mid - 1] + ordered[mid]) / 2.0)
-    if median <= 0:
-        return list(wall_ms), 1.0
-    scale = playback_ms / float(median)
-    if scale >= 1.0:
-        # Already at or slower than the requested pace -- do not stretch a clip
-        # that plays fine, only compress one that does not.
-        return list(wall_ms), 1.0
-    return [max(20, min(1000, int(round(d * scale)))) for d in wall_ms], 1.0 / scale
-
-
-_VERDICT = re.compile(r"^(PASSED|FAILED)\s*\(passed=(\d+),\s*failed=(\d+)\s*,\s*"
-                      r"errors=(\d+)\)", re.M)
-_LEGACY = re.compile(r"Passed[:\s]+(\d+).*?Failed[:\s]+(\d+)", re.S | re.I)
-_RAN = re.compile(r"^Ran (\d+) tests?$", re.M)
-
-
-def _parse_test_output(out: str) -> dict:
-    """Harness text -> {ok, passed, failed, errors, ran, reason?, out}."""
-    tail = out[-2000:]
-    m = _VERDICT.search(out)
-    if m:
-        verdict = m.group(1)
-        passed, failed, errors = int(m.group(2)), int(m.group(3)), int(m.group(4))
-    else:
-        legacy = _LEGACY.search(out)
-        if not legacy:
-            reason = ("simulator-unreachable" if "Unable to connect to simulator" in out
-                      else "no-verdict")
-            return {"ok": False, "reason": reason, "passed": 0, "failed": 0, "out": tail}
-        passed, failed, errors = int(legacy.group(1)), int(legacy.group(2)), 0
-        verdict = "PASSED" if failed == 0 else "FAILED"
-    ran_m = _RAN.search(out)
-    ran = int(ran_m.group(1)) if ran_m else passed + failed + errors
-    res = {"ok": verdict == "PASSED" and failed == 0 and errors == 0 and ran > 0,
-           "passed": passed, "failed": failed, "errors": errors, "ran": ran, "out": tail}
-    if ran == 0:
-        res["reason"] = "zero-tests"
-    return res

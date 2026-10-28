@@ -75,6 +75,11 @@ cli.py  ──►  sim/client.py ──sim/transport.py (JSON lines)──►  s
   single-threaded by design; all concurrency lives in the broker. Anything that
   drives gestures or reads the screen belongs here (`reach` included), not in
   the broker — the broker decides *when* work runs, not what a nav step is.
+* **`sim/seed.py`** — seeding (`apply`/`restore`, path containment, git-dirty guard);
+  `SimSession.seed`/`restore` only hold the backup between them. No GUI.
+* **`sim/recording.py`** — pure helpers behind `record`/`run_tests`: GIF frame timing,
+  contact sheet, test-output parser. Captures nothing.
+* **`sim/errors.py`** — `SimError`, apart so `seed.py` needn't import `session.py`.
 * **`sim/client.py`** — client library + `ciqkit sim` CLI. Auto-spawns the daemon
   ssh-agent style on first use.
 * **`sim/mcp_server.py`** — hand-rolled JSON-RPC 2.0 over stdio (no MCP SDK

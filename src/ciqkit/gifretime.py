@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from ciqkit.sim.session import _compress_durations
+from ciqkit.sim.recording import _compress_durations
 
 
 def retime(path: str, playback_ms: int = 120) -> dict:

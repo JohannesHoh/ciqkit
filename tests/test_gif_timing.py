@@ -2,7 +2,7 @@
 import pytest
 
 from ciqkit.gifretime import retime
-from ciqkit.sim.session import _compress_durations, _flatten_overhead_gaps
+from ciqkit.sim.recording import _compress_durations, _flatten_overhead_gaps
 
 
 def test_slow_capture_is_compressed_to_the_requested_median():
