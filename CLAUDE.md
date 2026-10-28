@@ -20,6 +20,7 @@ pytest                        # full suite — no simulator, SDK, GUI or display
 pytest tests/test_scheduler.py::test_urgent_preempts_batch -q   # single test
 ruff check src tests          # lint (line-length 100)
 ciqkit doctor                 # environment check; not run in CI
+python3 scripts/sim_smoke.py   # real-simulator smoke of every op -> docs/sim-smoke.jsonl (commit it)
 ```
 
 SDK MCP server (`tools/sdk-mcp`, separate Node project):

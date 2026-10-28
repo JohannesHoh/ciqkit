@@ -56,7 +56,13 @@ place you stall.
    while the simulator starts? Does a missing permission produce a message
    that names the fix? Does anything write outside `~/.config/ciqkit`, the
    project and the private runtime dir?
-6. Fix or ticket every stall before going on. A dry run on this machine
+6. Run `python3 scripts/sim_smoke.py` (from the dev venv) on the macOS and
+   the Windows desktop and commit the lines it appends to
+   `docs/sim-smoke.jsonl`. It drives every public session op once through the
+   broker on a real simulator; the test suite only ever drives a fake. Every
+   op must pass, or be skipped with a reason the platform explains;
+   `python3 scripts/sim_smoke_reading.py` should read 1.0 on macOS.
+7. Fix or ticket every stall before going on. A dry run on this machine
    without the simulator is logged in the WP9 notes; it is not a substitute.
 
 ## B. Decisions still open

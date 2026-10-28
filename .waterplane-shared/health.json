@@ -1,0 +1,12 @@
+{
+  "readings": [
+    {
+      "key": "simOpsVerified",
+      "name": "Sim ops verified on a real simulator (30 d)",
+      "means": "Share of SimSession ops with a passing real-simulator smoke run in the last 30 days; the tests only ever drive a fake.",
+      "better": "higher",
+      "unit": "share",
+      "run": ["python3", "scripts/sim_smoke_reading.py"]
+    }
+  ]
+}
