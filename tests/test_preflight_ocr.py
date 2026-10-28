@@ -209,6 +209,87 @@ def test_a_backend_that_raises_degrades_to_empty_text(monkeypatch):
     assert ocr.text(Boom()) == ""
 
 
+
+def _only_backend(monkeypatch, name, module):
+    """Make `name` the one importable OCR backend, whatever this machine has.
+
+    A None entry in sys.modules makes `import` raise ImportError, which is how
+    a missing backend looks to `backend()`.
+    """
+    for mod in ("ocrmac", "ocrmac.ocrmac", "winocr", "pytesseract"):
+        monkeypatch.setitem(sys.modules, mod, None)
+    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(ocr, "_checked", False)
+    monkeypatch.setattr(ocr, "_BACKEND", None)
+
+
+def test_backend_selection_prefers_windows_ocr_over_tesseract(monkeypatch):
+    import types
+    _only_backend(monkeypatch, "pytesseract", types.ModuleType("pytesseract"))
+    monkeypatch.setitem(sys.modules, "winocr", types.ModuleType("winocr"))
+    assert ocr.backend() == "windows"
+
+
+def test_backend_selection_is_none_without_any_backend(monkeypatch):
+    import types
+    _only_backend(monkeypatch, "winocr", types.ModuleType("winocr"))
+    monkeypatch.setitem(sys.modules, "winocr", None)
+    assert ocr.backend() is None
+    assert ocr.contains_any(object(), ["total"]) is None
+
+
+def test_windows_ocr_uses_the_configured_language(monkeypatch):
+    """A localised Windows may lack the English OCR pack; CIQKIT_OCR_LANG
+    picks the one it has."""
+    import types
+
+    from PIL import Image
+    seen = {}
+
+    def recognize_pil_sync(img, lang):
+        seen["mode"], seen["lang"] = img.mode, lang
+        return {"text": "Total 12"}
+    winocr = types.ModuleType("winocr")
+    winocr.recognize_pil_sync = recognize_pil_sync
+    _only_backend(monkeypatch, "winocr", winocr)
+    monkeypatch.setenv("CIQKIT_OCR_LANG", "de")
+
+    assert ocr.text(Image.new("L", (4, 4))) == "total 12"
+    assert seen == {"mode": "RGB", "lang": "de"}
+
+
+def test_windows_ocr_missing_language_pack_skips_the_anchor(monkeypatch):
+    """A missing pack raises inside winocr: that is "no text", so the anchor
+    is skipped -- never reported as contradicted."""
+    import types
+
+    from PIL import Image
+
+    def recognize_pil_sync(_img, _lang):
+        raise OSError("language pack not installed")
+    winocr = types.ModuleType("winocr")
+    winocr.recognize_pil_sync = recognize_pil_sync
+    _only_backend(monkeypatch, "winocr", winocr)
+
+    assert ocr.contains_any(Image.new("RGB", (4, 4)), ["total"]) is None
+
+
+def test_tesseract_reads_an_upscaled_greyscale_copy(monkeypatch):
+    import types
+
+    from PIL import Image
+    seen = {}
+
+    def image_to_string(img):
+        seen["mode"], seen["size"] = img.mode, img.size
+        return "SETTINGS\n"
+    tess = types.ModuleType("pytesseract")
+    tess.image_to_string = image_to_string
+    _only_backend(monkeypatch, "pytesseract", tess)
+
+    assert ocr.contains_any(Image.new("RGB", (10, 6)), ["settings"]) is True
+    assert seen == {"mode": "L", "size": (30, 18)}
+
 # --- preflight memoization ---------------------------------------------------
 
 def test_a_preflight_failure_is_not_cached(monkeypatch):
