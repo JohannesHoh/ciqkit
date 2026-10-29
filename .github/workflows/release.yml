@@ -56,8 +56,10 @@ jobs:
 
       - name: Build sdist and wheel
         run: |
-          python -m pip install --upgrade build
-          python -m build
+          # Hash-locked build + hatchling; --no-isolation stops `build` from
+          # fetching an unhashed backend into a throwaway env.
+          python -m pip install --require-hashes -r .github/requirements/release.txt
+          python -m build --no-isolation
 
       - name: Built version matches the tag
         run: |

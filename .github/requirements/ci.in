@@ -1,0 +1,9 @@
+# CI test deps: the "dev" extra of pyproject.toml, plus the build backend so
+# the editable install runs with --no-build-isolation instead of fetching an
+# unhashed hatchling. Regenerate ci.txt with the command in its header.
+pytest>=9.0.3
+ruff>=0.6
+Pillow>=13.0
+numpy>=1.24
+hatchling>=1.27
+editables  # hatchling's editable-install hook imports it

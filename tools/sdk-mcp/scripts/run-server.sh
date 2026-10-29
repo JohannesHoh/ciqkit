@@ -10,8 +10,11 @@ cd "$DIR"
 
 if [ ! -f dist/index.js ]; then
   echo "ciqkit-sdk-mcp: first run, building..." >&2
+  # Lockfile only: no `npm install` fallback, which would resolve unpinned
+  # versions. The npm package ships dist/, so this path is checkout-only and
+  # package-lock.json is always there.
   if [ ! -d node_modules ]; then
-    npm ci >&2 || npm install >&2
+    npm ci >&2
   fi
   npm run build >&2
 fi

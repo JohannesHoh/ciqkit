@@ -37,8 +37,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # Hash-locked deps first, then the project itself with --no-deps and the
+      # locked hatchling, so nothing unhashed is fetched (Scorecard
+      # Pinned-Dependencies). Mirrors the "dev" extra; see .github/requirements/.
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          pip install --require-hashes -r .github/requirements/ci.txt
+          pip install --no-deps --no-build-isolation -e .
 
       - name: Lint
         run: ruff check src tests

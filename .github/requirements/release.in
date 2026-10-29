@@ -1,0 +1,4 @@
+# Release build tooling: `python -m build --no-isolation` uses the hatchling
+# pinned here instead of fetching an unhashed one into an isolated env.
+build
+hatchling>=1.27
