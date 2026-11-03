@@ -62,6 +62,10 @@ them on Linux. `tests/test_scheduler.py` shows the pattern: a `FakeSession`
 records the order chunks execute in, which is enough to prove priority ordering,
 preemption, resume and bump.
 
+**Policy:** new functionality ships with tests that exercise it, and a bug fix
+ships with a test that fails without the fix. A change without one is not
+merged.
+
 If your change touches the scheduler, add a case there. If it touches image
 processing, add a small synthetic image rather than committing a real
 screenshot.
