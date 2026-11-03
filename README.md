@@ -1,5 +1,7 @@
 # ciqkit
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16300/badge)](https://www.bestpractices.dev/projects/16300)
+
 Verified screenshots, navigation and unit tests from the Connect IQ Simulator, for
 scripts, CI and coding agents building [Garmin Connect IQ](https://developer.garmin.com/connect-iq/) watch apps.
 Unofficial; not affiliated with Garmin ([TRADEMARKS.md](TRADEMARKS.md)).
