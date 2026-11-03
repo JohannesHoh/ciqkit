@@ -84,6 +84,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "B"]
+"fuzz/*" = ["S", "B"]   # property asserts, like tests/
 # S110 (try/except/pass) is the intended shape in the code that drives a GUI we
 # do not control: dismissing a dialog that may not be there, re-binding a window
 # that may have moved, releasing a lease during teardown. Every one of these is

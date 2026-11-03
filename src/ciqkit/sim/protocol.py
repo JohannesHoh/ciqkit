@@ -319,7 +319,9 @@ def _swipe_errors(step, where) -> list[str]:
         errs.append(f"{where}: swipe direction {d!r} must be one of "
                     f"{', '.join(SWIPE_DIRECTIONS)}")
     e = step.get("edge")
-    if e is not None and e not in EDGE_SWIPES:
+    # isinstance first: EDGE_SWIPES is a dict, and `[] in dict` raises
+    # TypeError out of the validator instead of reporting (found by fuzz/).
+    if e is not None and not (isinstance(e, str) and e in EDGE_SWIPES):
         errs.append(f"{where}: swipe edge {e!r} must be one of "
                     f"{', '.join(EDGE_SWIPES)}")
     f = step.get("from")
@@ -388,6 +390,13 @@ def validate_job(job: Job) -> list[str]:
     one chunk at a time.
     """
     errs = []
+    # JSON can put any type in any field. These went through unchecked until
+    # fuzz/ tried it: `id: 7` was accepted and then unreachable by WAIT (which
+    # names jobs by string), and `app: {...}` reached the session as a path.
+    for name in ("app", "device", "owner", "label", "id"):
+        v = getattr(job, name)
+        if not isinstance(v, str):
+            errs.append(f"{name} must be a string, got {type(v).__name__}")
     if not job.chunks:
         # Zero chunks is never runnable and never terminal: its WAIT hung to
         # the timeout and it kept the broker from ever idling out.
@@ -396,7 +405,9 @@ def validate_job(job: Job) -> list[str]:
         errs.append(e)
     for i, c in enumerate(job.chunks):
         where = f"chunk {i} ({c.kind!r})"
-        req = CHUNK_REQUIRED.get(c.kind)
+        # Before the CHUNK_REQUIRED lookup: a list kind is unhashable, and the
+        # refusal read "cannot use 'list' as a dict key" instead of this.
+        req = CHUNK_REQUIRED.get(c.kind) if isinstance(c.kind, str) else None
         if req is None:
             errs.append(f"{where}: unknown chunk kind; expected one of "
                         f"{', '.join(sorted(CHUNK_REQUIRED))}")
@@ -406,8 +417,10 @@ def validate_job(job: Job) -> list[str]:
             continue
         for key in req:
             alts = key if isinstance(key, tuple) else (key,)
-            if not any(c.args.get(a) for a in alts):
-                errs.append(f"{where}: missing {' or '.join(alts)}")
+            # A non-empty STRING: every required arg is a path or a file name,
+            # and `name: ["x"]` used to pass as merely truthy.
+            if not any(isinstance(v := c.args.get(a), str) and v for a in alts):
+                errs.append(f"{where}: missing {' or '.join(alts)} (a non-empty string)")
         if c.kind == ChunkKind.ACT:
             errs.extend(step_errors(c.args, where))
         elif c.kind == ChunkKind.LOAD and c.args.get("fit") is not None:

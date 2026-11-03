@@ -120,10 +120,31 @@ def _compress_durations(wall_ms: list[int], playback_ms: int) -> tuple[list[int]
     return [max(20, min(1000, int(round(d * scale)))) for d in wall_ms], 1.0 / scale
 
 
-_VERDICT = re.compile(r"^(PASSED|FAILED)\s*\(passed=(\d+),\s*failed=(\d+)\s*,\s*"
-                      r"errors=(\d+)\)", re.M)
-_LEGACY = re.compile(r"Passed[:\s]+(\d+).*?Failed[:\s]+(\d+)", re.S | re.I)
-_RAN = re.compile(r"^Ran (\d+) tests?$", re.M)
+# Counts are capped at 9 digits: int() refuses strings over 4300 digits
+# (CVE-2020-10735 limit), so an uncapped group turned a garbage line in the
+# harness output into a ValueError out of the parser instead of "no-verdict".
+_VERDICT = re.compile(r"^(PASSED|FAILED)\s*\(passed=(\d{1,9}),\s*failed=(\d{1,9})\s*,\s*"
+                      r"errors=(\d{1,9})\)", re.M)
+# The legacy summary is "Passed: N ... Failed: M". It used to be one regex,
+# `Passed[:\s]+(\d+).*?Failed[:\s]+(\d+)`, which `search` retried from every
+# "Passed" when no "Failed" followed: quadratic, 72 KB of "Passed 1 " took over
+# a second (found by fuzz/). Two anchored searches give the same match -- the
+# first "Passed" with a "Failed" after it is always the first "Passed" -- in
+# linear time. tests/test_fuzz_targets.py pins the two to the same verdict.
+_LEGACY_PASSED = re.compile(r"Passed[:\s]+(\d{1,9})", re.I)
+_LEGACY_FAILED = re.compile(r"Failed[:\s]+(\d{1,9})", re.I)
+_RAN = re.compile(r"^Ran (\d{1,9}) tests?$", re.M)
+
+
+def _legacy_counts(out: str) -> tuple[int, int] | None:
+    """(passed, failed) from a legacy "Passed: N ... Failed: M" summary, or None."""
+    p = _LEGACY_PASSED.search(out)
+    if p is None:
+        return None
+    f = _LEGACY_FAILED.search(out, p.end())
+    if f is None:
+        return None
+    return int(p.group(1)), int(f.group(1))
 
 
 def _parse_test_output(out: str) -> dict:
@@ -134,12 +155,12 @@ def _parse_test_output(out: str) -> dict:
         verdict = m.group(1)
         passed, failed, errors = int(m.group(2)), int(m.group(3)), int(m.group(4))
     else:
-        legacy = _LEGACY.search(out)
-        if not legacy:
+        legacy = _legacy_counts(out)
+        if legacy is None:
             reason = ("simulator-unreachable" if "Unable to connect to simulator" in out
                       else "no-verdict")
             return {"ok": False, "reason": reason, "passed": 0, "failed": 0, "out": tail}
-        passed, failed, errors = int(legacy.group(1)), int(legacy.group(2)), 0
+        (passed, failed), errors = legacy, 0
         verdict = "PASSED" if failed == 0 else "FAILED"
     ran_m = _RAN.search(out)
     ran = int(ran_m.group(1)) if ran_m else passed + failed + errors

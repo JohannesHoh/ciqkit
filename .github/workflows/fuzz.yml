@@ -1,0 +1,64 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the places untrusted text enters ciqkit: the
+# broker's control-channel SUBMIT path and the simulator test-output parser.
+# Properties live in fuzz/targets.py; tests/test_fuzz_targets.py replays them
+# with a fixed seed in every platform's pytest. Separate from ci.yml on
+# purpose: release.yml gates on ci.yml, and a fuzz run is not deterministic.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 3 * * 1"   # weekly: a longer run than the per-push one
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  atheris:
+    name: atheris (${{ matrix.harness }})
+    # Atheris ships Linux x86_64 wheels only.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [fuzz_wire, fuzz_test_output]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # Hash-locked (Scorecard Pinned-Dependencies). ciqkit itself comes from
+      # src/ via PYTHONPATH: the fuzzed modules are stdlib-only.
+      - name: Install
+        run: pip install --require-hashes -r .github/requirements/fuzz.txt
+
+      - name: Fuzz
+        env:
+          PYTHONPATH: src
+          # 60 s per push/PR, 10 min on the weekly schedule.
+          SECONDS_BUDGET: ${{ github.event_name == 'schedule' && '600' || '60' }}
+        run: |
+          mkdir -p fuzz-artifacts
+          python "fuzz/${{ matrix.harness }}.py" \
+            -max_total_time="$SECONDS_BUDGET" -timeout=5 -rss_limit_mb=2048 \
+            -artifact_prefix=fuzz-artifacts/
+
+      # The crashing input, so a find can be replayed locally with
+      # `python fuzz/<harness>.py fuzz-artifacts/crash-...`.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ matrix.harness }}
+          path: fuzz-artifacts/
+          if-no-files-found: ignore

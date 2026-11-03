@@ -18,6 +18,11 @@ has, install from a clone (`pip install -e ".[sim]"`).
 
 ### Added
 
+* `fuzz/`: Atheris harnesses for the broker's control-channel SUBMIT path and
+  the simulator test-output parser, run by `.github/workflows/fuzz.yml`
+  (60 s per push, 10 min weekly). `tests/test_fuzz_targets.py` replays the
+  same properties with a fixed seed on every platform. What they found is
+  under Fixed.
 * `tools/sdk-mcp`: `CIQKIT_SDK_MCP_DATA_DIR` (absolute path) points the server at
   a project's own data directory — `gotchas.json` is read from there, and an
   `sdk-index.json` in it takes precedence over the user cache.
@@ -176,6 +181,15 @@ has, install from a clone (`pip install -e ".[sim]"`).
 
 ### Fixed
 
+* The control channel no longer accepts wrongly-typed client fields: `id: 7`
+  (then unreachable by WAIT), a non-string `app`/`device`/`owner`/`label`, or
+  a required chunk arg that is merely truthy (`name: ["x"]`). A list chunk
+  `kind` or swipe `edge` is refused with a reason instead of a raw
+  `TypeError` (found by fuzzing).
+* The test-output parser is linear: its legacy "Passed … Failed" regex was
+  quadratic when no "Failed" followed (72 KB took over a second). Counts over
+  9 digits no longer raise `ValueError` from Python's int-length limit (found
+  by fuzzing).
 * `button` steps now accept `id` (canonical) or `button` (alias) in both nav recipes and
   ACT chunks; one validator (`protocol.step_errors`) checks steps at submit time.
 * macOS: the device window is chosen by title ("CIQ Simulator - ..."), not "window 1",

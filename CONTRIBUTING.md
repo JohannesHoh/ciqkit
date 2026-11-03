@@ -42,7 +42,7 @@ Checks, all of which CI runs:
 
 ```bash
 pytest                 # unit tests: no simulator, no SDK, no GUI needed
-ruff check src tests   # lint
+ruff check src tests fuzz   # lint
 ciqkit doctor          # your own environment (not run in CI)
 ```
 
@@ -68,7 +68,7 @@ screenshot.
 
 ## Code style
 
-* `ruff check src tests` must pass; line length 100.
+* `ruff check src tests fuzz` must pass; line length 100.
 * Comments should explain *why*, especially where the code looks odd — most of
   the odd-looking code here is working around a real simulator behaviour, and
   the next person needs to know which.

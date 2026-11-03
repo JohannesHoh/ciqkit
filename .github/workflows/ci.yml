@@ -46,7 +46,7 @@ jobs:
           pip install --no-deps --no-build-isolation -e .
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests fuzz
 
       - name: Test
         run: pytest -q

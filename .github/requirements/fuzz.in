@@ -1,0 +1,4 @@
+# Fuzz job deps (Linux x86_64 only: Atheris ships no other wheels). The
+# harnesses import ciqkit from src/ via PYTHONPATH, so nothing else is needed.
+# Regenerate fuzz.txt with the command in its header.
+atheris==3.1.0

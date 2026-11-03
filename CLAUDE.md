@@ -18,7 +18,8 @@ core.
 pip install -e ".[dev,sim]"   # dev setup
 pytest                        # full suite — no simulator, SDK, GUI or display needed
 pytest tests/test_scheduler.py::test_urgent_preempts_batch -q   # single test
-ruff check src tests          # lint (line-length 100)
+ruff check src tests fuzz     # lint (line-length 100)
+PYTHONPATH=src python fuzz/fuzz_wire.py -max_total_time=60   # Atheris; Linux x86_64 only
 ciqkit doctor                 # environment check; not run in CI
 python3 scripts/sim_smoke.py   # real-simulator smoke of every op -> docs/sim-smoke.jsonl (commit it)
 ```
