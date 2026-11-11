@@ -1305,6 +1305,50 @@ def focus_window(hwnd) -> None:
 DEFAULT_GRAB_SETTLE_S = 1.0
 
 
+def _pointer_park_point(win, screen, pointer):
+    """Where to move the mouse so it is not in `win`'s pixels, or None.
+
+    `win` and `screen` are (x, y, w, h) in logical px; `pointer` is (x, y). A
+    pointer already outside the window (with a margin for the arrow's size)
+    stays put. Otherwise: the free side with the most room (right, left,
+    below, above), 40 px in from the screen edge -- never a corner, which
+    would trip pyautogui's fail-safe."""
+    wx, wy, ww, wh = win
+    sx, sy, sw, sh = screen
+    px, py = pointer
+    m = 40
+    if not (wx - m <= px <= wx + ww + m and wy - m <= py <= wy + wh + m):
+        return None
+    cy = min(max(py, sy + 60), sy + sh - 60)
+    cx = min(max(px, sx + 60), sx + sw - 60)
+    room = [
+        (sx + sw - (wx + ww), (sx + sw - 40, cy)),
+        (wx - sx, (sx + 40, cy)),
+        (sy + sh - (wy + wh), (cx, sy + sh - 40)),
+        (wy - sy, (cx, sy + 40)),
+    ]
+    room.sort(key=lambda r: -r[0])
+    if room[0][0] < 2 * m:
+        return (sx + sw - 40, sy + 100)   # window fills the screen: best effort
+    return room[0][1]
+
+
+def _park_pointer(win):
+    """macOS: move the pointer out of the window before a grab, so a mouse
+    resting on the watch (left there by the last tap) is not in the frame.
+    Best effort -- any failure leaves the pointer where it is."""
+    try:
+        import Quartz
+        loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+        b = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+        screen = (b.origin.x, b.origin.y, b.size.width, b.size.height)
+        dest = _pointer_park_point(win, screen, (loc.x, loc.y))
+        if dest is not None:
+            Quartz.CGWarpMouseCursorPosition(Quartz.CGPointMake(*dest))
+    except Exception:
+        pass
+
+
 def _quartz_region_png(x: int, y: int, w: int, h: int, path: str) -> bool:
     """Grab the on-screen rect (logical px) to a PNG via Quartz. False on any
     failure, so the caller falls back to the `screencapture` CLI."""
@@ -1376,6 +1420,7 @@ def capture_window(hwnd, *, grab_settle_s: float | None = None,
             time.sleep(settle)
 
         region = (hwnd.left, hwnd.top, hwnd.width, hwnd.height)
+        _park_pointer(region)
         x, y, w, h = [int(v) for v in region]
 
         # pyautogui/pyscreeze is unreliable on newer macOS setups and can leave

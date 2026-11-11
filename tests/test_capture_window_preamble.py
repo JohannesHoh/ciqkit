@@ -88,6 +88,7 @@ def mac(monkeypatch, tmp_path):
     # Quartz is tried first and "fails" here, so the CLI path above is what
     # these tests exercise; test_quartz_grab_skips_the_cli covers the other.
     monkeypatch.setattr(su, "_quartz_region_png", lambda *_a: False)
+    monkeypatch.setattr(su, "_park_pointer", lambda _w: None)
     calls.probe_result = probe_result
     calls.regions = regions
     return calls
@@ -209,3 +210,23 @@ def test_quartz_grab_skips_the_cli(mac, monkeypatch):
     img, _ = su.capture_window(_FakeWindow(), refocus=False, grab_settle_s=0)
     assert "quartz" in mac and "grab" not in mac
     assert img.size == (400, 400)
+
+
+def test_pointer_park_point_moves_a_pointer_over_the_window_out_of_it():
+    win, screen = (100, 100, 300, 400), (0, 0, 1920, 1080)
+    # Over the watch: parked on the roomiest side (right), off the window.
+    x, y = su._pointer_park_point(win, screen, (250, 300))
+    assert x > 100 + 300 and 0 < y < 1080
+    # Already well clear: left alone.
+    assert su._pointer_park_point(win, screen, (1500, 900)) is None
+    # Window hugging the right edge: parks left, never in a corner.
+    x, y = su._pointer_park_point((1500, 100, 400, 400), screen, (1600, 200))
+    assert x < 1500 and 0 < y < 1080
+
+
+def test_capture_window_parks_the_pointer_before_the_grab(mac, monkeypatch):
+    mac.append("reset")
+    monkeypatch.setattr(su, "_park_pointer", lambda w: mac.append(("park", w)))
+    su.capture_window(_FakeWindow(), refocus=False, grab_settle_s=0)
+    i = list(mac).index(("park", (100, 200, 300, 400)))
+    assert list(mac)[i + 1] == "grab"
