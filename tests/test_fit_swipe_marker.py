@@ -464,3 +464,15 @@ def test_cli_parses_fit_on_marker_and_shot_on():
     assert a.marker == ["A B=one", "C=two"] and a.fit == "f"
     assert p.parse_args(["nav", "--to", "s", "--fit", "f"]).fit == "f"
     assert p.parse_args(["record", "r", "--fit", "f"]).fit == "f"
+
+
+def test_fit_load_script_waits_for_the_source_menu_before_indexing_it():
+    """Flake: a fixed delay then `menu 1` failed (-1719) when the popup was slow to open."""
+    s = sw.FIT_LOAD_SCRIPT
+    click = s.index("click pop up button 1 of window")
+    wait = s.index("exists menu 1 of pop up button 1")
+    pick = s.index('click menu item "' + sw.FIT_SOURCE_ITEM + '"')
+    assert click < wait < pick
+    assert "repeat with attempt from 1 to 2" in s  # re-click once
+    assert "ERR source menu did not open" in s
+    assert "my winIx()" in s[click:pick]  # window index re-resolved each time
