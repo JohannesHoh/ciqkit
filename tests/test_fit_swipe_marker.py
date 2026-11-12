@@ -66,6 +66,7 @@ def _drive(monkeypatch, tmp_path, states, load="OK"):
     f.write_bytes(b"x")
     monkeypatch.setattr(su, "IS_MAC", True)
     monkeypatch.setattr(su.time, "sleep", lambda s: None)
+    monkeypatch.setattr(su, "stage_fit_for_panel", lambda p: p)  # tmp_path is itself under /var/folders
     monkeypatch.setattr(su.subprocess, "run", lambda *a, **k: _Proc(load))
     seq = iter(states)
     calls = []
@@ -476,3 +477,21 @@ def test_fit_load_script_waits_for_the_source_menu_before_indexing_it():
     assert "repeat with attempt from 1 to 2" in s  # re-click once
     assert "ERR source menu did not open" in s
     assert "my winIx()" in s[click:pick]  # window index re-resolved each time
+
+
+def test_stage_fit_for_panel_moves_temp_files_only(tmp_path):
+    # the file panel cannot open a file under the per-user temp dir: such a file is staged
+    stage = tmp_path / "stage"
+    src = tmp_path / "trim.fit"
+    src.write_bytes(b"FIT")
+    assert su.stage_fit_for_panel(str(src), str(stage)) == str(src) or os.path.realpath(str(src)).startswith("/private/var/folders/")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as f:
+        f.write(b"FITDATA")
+    if os.path.realpath(f.name).startswith("/private/var/folders/"):
+        out = su.stage_fit_for_panel(f.name, str(stage))
+        assert out == str(stage / os.path.basename(f.name))
+        assert open(out, "rb").read() == b"FITDATA"
+    os.unlink(f.name)
+    home = os.path.expanduser("~/x.fit")
+    assert su.stage_fit_for_panel(home, str(stage)) == home

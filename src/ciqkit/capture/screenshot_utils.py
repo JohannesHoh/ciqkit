@@ -45,6 +45,7 @@ import logging
 import os
 import sys
 import time
+import shutil
 import subprocess
 import tempfile
 
@@ -1034,6 +1035,29 @@ def read_fit_playback() -> dict:
     return _fit_osascript(_sw.FIT_STATE_SCRIPT, "state")
 
 
+#: Where FIT/GPX files are copied before the file panel loads them (see stage_fit_for_panel).
+FIT_STAGE_DIR = os.path.join(os.path.expanduser("~"), "Library", "Caches", "ciqkit", "fit")
+
+
+def stage_fit_for_panel(path: str, stage_dir: str = None) -> str:
+    """The path to type into the file panel's Go-to-folder sheet for ``path``.
+
+    The panel will not open a file under the per-user temp dir (``/var/folders/..``,
+    where ``tempfile``/``os.tmpdir()`` put files, either spelling): the sheet takes
+    the path but the window stays empty (2026-11-12, SDK 9.1.0; a home or ``/tmp``
+    path loads). Such a file is copied to ``FIT_STAGE_DIR`` under its own name, and
+    that copy is loaded; any other path is returned unchanged.
+    """
+    real = os.path.realpath(path)
+    if not (real.startswith("/private/var/folders/") or real.startswith("/var/folders/")):
+        return path
+    stage_dir = stage_dir or FIT_STAGE_DIR
+    os.makedirs(stage_dir, exist_ok=True)
+    dst = os.path.join(stage_dir, os.path.basename(path))
+    shutil.copyfile(real, dst)
+    return dst
+
+
 def start_fit_playback(path: str, advance_s: float = 12.0,
                        close_window: bool = True) -> dict:
     """Simulation > Activity Data > FIT/GPX Playable File: load ``path`` and press
@@ -1050,6 +1074,7 @@ def start_fit_playback(path: str, advance_s: float = 12.0,
     if not os.path.isfile(path):
         res["reason"] = f"no such file: {path}"
         return res
+    path = stage_fit_for_panel(path)
     try:
         r = subprocess.run(["osascript", "-e", _sw.FIT_LOAD_SCRIPT, path],
                            capture_output=True, text=True, timeout=60)
