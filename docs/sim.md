@@ -229,7 +229,11 @@ to twice (`"retries": N` on a step changes that, 0–3; the broker log notes
 every retry). Inputs do get dropped -- most often the first key after a cold
 load -- and because a retry only follows a full window with no visible effect,
 a START press is not sent twice unless the app took longer than that window to
-react to the first one. A failure is reported as `step N of M` (1-based).
+react to the first one. Before any re-send the frames are also compared pixel
+by pixel over the display (the profile's display box, else the detected
+face; pixels already moving before the input -- a blinking dot, a late icon --
+are ignored); if anything moved (one digit of a counter), the
+input landed: it is not re-sent and the result says `"change": "small"`. A failure is reported as `step N of M` (1-based).
 
 `kind` is `tap` (with `x`/`y` as 0–1 fractions of the screen), `hold` (the
 same, held ~1.6 s), `swipe` (with `direction`), `key` (with `key`: `enter`

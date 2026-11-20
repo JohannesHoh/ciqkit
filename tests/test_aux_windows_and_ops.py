@@ -208,12 +208,30 @@ def test_unrelated_crash_dialog_is_not_touched():
 
 
 def test_adb_and_tcc_alerts_still_get_ok_or_allow():
-    scan = "\n".join([
+    scan = sw.RS.join([
         _scan("UserNotificationCenter", 1, ["There is no data connection"], ["OK"]),
         _scan("UserNotificationCenter", 2, ["node would like to access data"],
               ["Don't Allow", "Allow"])])
     assert su._plan_alert_clicks(scan) == [("UserNotificationCenter", 2, "Allow"),
                                            ("UserNotificationCenter", 1, "OK")]
+
+
+def test_multiline_alert_body_still_yields_its_click():
+    body = "There is no data connection.\nThe app may stall.\n\nCheck the ADB link."
+    scan = _scan("UserNotificationCenter", 1, [body], ["OK"]) + sw.RS
+    assert su._plan_alert_clicks(scan) == [("UserNotificationCenter", 1, "OK")]
+
+
+def test_five_stacked_alerts_give_five_clicks():
+    scan = "".join(
+        _scan("UserNotificationCenter", i, [f"No data connection\nline {i}"], ["OK"]) + sw.RS
+        for i in range(1, 6))
+    assert su._plan_alert_clicks(scan) == [("UserNotificationCenter", i, "OK")
+                                           for i in range(5, 0, -1)]
+
+
+def test_scan_script_ends_records_with_rs_not_linefeed():
+    assert "& RS\n" in su._SCAN_ALERTS_SCRIPT and "linefeed" not in su._SCAN_ALERTS_SCRIPT
 
 
 def test_dismissed_events_land_on_the_step_result(monkeypatch):
@@ -309,3 +327,12 @@ def test_real_macos_crash_dialog_gets_ignore_not_reopen_or_report():
     assert su._plan_alert_clicks(scan) == [("UserNotificationCenter", 1, "Ignore")]
     ev = su.drain_dismissed()[0]
     assert ev["process"] == "Connect IQ Device Simulator" and ev["clicked"] == "Ignore"
+
+
+def test_osascript_scripts_define_every_separator_they_use():
+    """An undefined RS inside try..end try is swallowed: every window skipped,
+    empty output, no error."""
+    for script in (su._LIST_WINDOWS_SCRIPT, su._SCAN_ALERTS_SCRIPT):
+        for var in ("FS", "RS"):
+            if f"& {var}" in script or f"{var} &" in script:
+                assert f"set {var} to (ASCII character" in script, var

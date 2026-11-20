@@ -21,6 +21,8 @@ DEVICE_TITLE_PREFIX = "CIQ Simulator"
 
 #: Field separator in the window listing the AppleScript prints.
 FS = "\x1f"
+# Record separator for scans: alert bodies contain newlines, so a linefeed cannot end a record.
+RS = "\x1e"
 
 # Titles of windows that are alerts the dialog dismisser already owns, not
 # auxiliary windows to close (closing "Error" with the close button does not

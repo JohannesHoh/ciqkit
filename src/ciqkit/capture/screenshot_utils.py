@@ -753,6 +753,7 @@ def device_token():
 
 _LIST_WINDOWS_SCRIPT = (
     'set FS to (ASCII character 31)\n'
+    'set RS to (ASCII character 30)\n'
     'tell application "System Events"\n'
     '    set procs to (processes whose name is "simulator")\n'
     '    if (count of procs) is 0 then return ""\n'
@@ -774,7 +775,7 @@ _LIST_WINDOWS_SCRIPT = (
     '                end repeat\n'
     '            end try\n'
     '            set out to out & nm & FS & sr & FS & (item 1 of pos) & FS & (item 2 of pos)'
-    ' & FS & (item 1 of sz) & FS & (item 2 of sz) & FS & bn & linefeed\n'
+    ' & FS & (item 1 of sz) & FS & (item 2 of sz) & FS & bn & RS\n'
     '        end try\n'
     '    end repeat\n'
     '    return out\n'
@@ -859,6 +860,7 @@ _ALERT_PROCS = ("UserNotificationCenter", "CrashReporter", "ReportCrash",
                 "Problem Reporter", "CrashReporterSupportHelper")
 _SCAN_ALERTS_SCRIPT = (
     'set FS to (ASCII character 31)\n'
+    'set RS to (ASCII character 30)\n'
     'set out to ""\n'
     'tell application "System Events"\n'
     '    repeat with pn in {@PROCS@}\n'
@@ -891,7 +893,7 @@ _SCAN_ALERTS_SCRIPT = (
     '                        set bn to bn & (name of b as text) & "|"\n'
     '                    end repeat\n'
     '                end try\n'
-    '                set out to out & (pn as text) & FS & wi & FS & tx & FS & bn & linefeed\n'
+    '                set out to out & (pn as text) & FS & wi & FS & tx & FS & bn & RS\n'
     '            end repeat\n'
     '        end try\n'
     '    end repeat\n'
@@ -911,8 +913,9 @@ def _plan_alert_clicks(scan_text: str) -> list:
     the ones still to do.
     """
     plan = []
-    for line in (scan_text or "").splitlines():
-        parts = line.split(_sw.FS)
+    # Records end in RS, not a newline: alert bodies embed newlines.
+    for line in (scan_text or "").split(_sw.RS):
+        parts = line.strip("\r\n").split(_sw.FS)
         if len(parts) < 4:
             continue
         pn, wi = parts[0], parts[1]

@@ -36,6 +36,9 @@ def _session_with_fake_screen(monkeypatch, changed: bool, ocr_result):
     monkeypatch.setattr(session_mod.ocr, "contains_any",
                         lambda img, anchors: ocr_result)
     monkeypatch.setattr(SimSession, "STABLE_S", 0)   # no pre-input settling here
+    # The strict pre-re-send check sees opaque frames here: "identical".
+    monkeypatch.setattr(SimSession, "_pixels_changed", lambda self, a, b, ignore=None: False)
+    monkeypatch.setattr(SimSession, "SETTLE_POLL_S", 0)
     return s
 
 
@@ -147,6 +150,84 @@ def test_every_kind_gets_its_retries(monkeypatch):
     assert len(inputs) == 3
 
 
+# --- a re-send needs a truly identical frame ----------------------------------
+
+_REAL_PIXELS_CHANGED = SimSession._pixels_changed
+
+
+def _hud(digit_on=False, noise_seed=None):
+    """A dark 240x240 HUD; ``digit_on`` lights 6 px of a small digit (the whole
+    effect of a BACK that bumps a counter); ``noise_seed`` adds +-2 levels of
+    capture noise everywhere."""
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    arr = np.zeros((240, 240, 3), dtype=np.int16)
+    arr[100:113, 60:181] = 90            # static label
+    arr[150:161, 120:122] = 200          # the "1"
+    if digit_on:
+        arr[150:152, 117:120] = 200
+    if noise_seed is not None:
+        arr += np.random.default_rng(noise_seed).integers(-2, 3, size=arr.shape)
+    return Image.fromarray(np.clip(arr, 0, 255).astype("uint8"), "RGB")
+
+
+def _frame_session(monkeypatch, after, ocr_result=None):
+    """act() over real synthetic frames: the first capture is the baseline,
+    every later one comes from ``after()``. The coarse test says "no change"
+    -- its real verdict on a one-digit change (see test_verify) -- and the
+    strict pre-re-send check is the real one."""
+    s = _session_with_fake_screen(monkeypatch, changed=False, ocr_result=ocr_result)
+    monkeypatch.setattr(SimSession, "_pixels_changed", _REAL_PIXELS_CHANGED)
+    monkeypatch.setattr(session_mod.su, "sim_display_box",
+                        lambda img, dev: (0, 0, 240, 240))
+    frames = {"n": 0}
+
+    def capture(self):
+        frames["n"] += 1
+        # Frame 1 is the baseline, frame 2 the pre-input stability probe.
+        return _hud(noise_seed=frames["n"]) if frames["n"] <= 2 else after()
+    monkeypatch.setattr(SimSession, "_capture", capture)
+    inputs = []
+    monkeypatch.setattr(SimSession, "_do_input",
+                        lambda self, *a, **k: inputs.append(a))
+    return s, inputs
+
+
+def test_a_one_digit_change_is_landed_not_resent(monkeypatch):
+    """A BACK on a training HUD changed one digit; read as "no effect" it was
+    sent three times and the attempts counter went 0 -> 2 -> 5."""
+    seeds = iter(range(1, 100))
+    s, inputs = _frame_session(
+        monkeypatch, lambda: _hud(digit_on=True, noise_seed=next(seeds)))
+    monkeypatch.setattr(SimSession, "_resolve_button", lambda self, b: None)
+    r = s.act("button", button="esc", delay=0, settle_s=0)
+    assert len(inputs) == 1, "a gesture that landed was sent again"
+    assert r["ok"] is True and r["confirmed"] is True
+    assert r["changed"] is True and r["change"] == "small"
+
+
+def test_an_identical_frame_is_still_resent(monkeypatch):
+    """The simulator does drop inputs; a truly unchanged screen keeps its retries."""
+    s, inputs = _frame_session(monkeypatch, lambda: _hud(noise_seed=0))
+    r = s.act("tap", delay=0, settle_s=0)
+    assert r["ok"] is False and len(inputs) == 3
+
+
+def test_capture_noise_is_not_mistaken_for_a_landed_gesture(monkeypatch):
+    seeds = iter(range(1, 100))
+    s, inputs = _frame_session(monkeypatch, lambda: _hud(noise_seed=next(seeds)))
+    r = s.act("key", key="enter", delay=0, settle_s=0)
+    assert r["ok"] is False and len(inputs) == 3
+
+
+def test_a_contradicted_anchor_after_a_small_change_fails_without_a_resend(monkeypatch):
+    s, inputs = _frame_session(monkeypatch, lambda: _hud(digit_on=True),
+                               ocr_result=False)
+    r = s.act("tap", anchor=["TOTAL"], delay=0, settle_s=0)
+    assert r["ok"] is False and r["change"] == "small"
+    assert len(inputs) == 1
+
+
 # --- the build must return what it just built --------------------------------
 
 def _prg(tmp_path, name, mtime):
@@ -206,3 +287,36 @@ def test_step_retries_are_bounded(given, expected):
     budget assumes a small retry count."""
     step = {} if given is None else {"retries": given}
     assert session_mod._step_retries(step) == expected
+
+
+def test_a_late_painting_element_is_not_taken_for_a_landed_gesture(monkeypatch):
+    """The baseline was stabilised with the coarse test only, so a small icon
+    that paints after it must not read as the input's effect: a dropped input
+    would be called landed and never re-sent."""
+    ImageDraw = pytest.importorskip("PIL.ImageDraw")
+
+    def with_icon(img):
+        ImageDraw.Draw(img).rectangle([200, 20, 203, 23], fill=(255, 255, 255))
+        return img
+
+    s, inputs = _frame_session(monkeypatch, lambda: with_icon(_hud(noise_seed=9)))
+    frames = {"n": 0}
+
+    def capture(self):
+        frames["n"] += 1
+        base = _hud(noise_seed=frames["n"])
+        # baseline: no icon; the probe (frame 2) already sees it appear
+        return base if frames["n"] == 1 else with_icon(base)
+    monkeypatch.setattr(SimSession, "_capture", capture)
+    r = s.act("tap", delay=0, settle_s=0)
+    assert r["ok"] is False and len(inputs) == 3
+
+
+def test_no_display_box_means_no_strict_proof(monkeypatch):
+    """On a scaled (Retina) capture sim_display_box is None; comparing the
+    whole window would count title-bar or banner pixels as the gesture."""
+    s = _session_with_fake_screen(monkeypatch, changed=False, ocr_result=None)
+    monkeypatch.setattr(SimSession, "_pixels_changed", _REAL_PIXELS_CHANGED)
+    monkeypatch.setattr(session_mod.su, "sim_display_box", lambda img, dev: None)
+    monkeypatch.setattr(SimSession, "_face_box", lambda self, img: None)
+    assert s._pixels_changed(_hud(), _hud(digit_on=True)) is False

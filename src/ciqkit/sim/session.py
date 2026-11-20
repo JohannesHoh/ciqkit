@@ -570,6 +570,56 @@ class SimSession:
             signatures_differ=su.signatures_differ,
             details_differ=su.details_differ)
 
+    def _strict_box(self, img):
+        """Where the strict check compares: the device profile's declared
+        display box, else the detected face box. Never the whole frame: on a
+        scaled (Retina) capture sim_display_box does not qualify, and the
+        whole window includes title bar, device art and anything overlapping
+        it (a banner, Spotlight), none of which is "the display"."""
+        try:
+            box = su.sim_display_box(img, self._device_id())
+        except Exception:
+            box = None
+        if box:
+            return box
+        try:
+            return self._face_box(img)
+        except Exception:
+            return None
+
+    def _unstable_mask(self, before):
+        """A second frame, taken before any input, strict-diffed against the
+        baseline. ``_wait_stable`` only used the coarse test, so a small
+        element still painting (status icon, blinking colon, GPS dot) is not in
+        the baseline and would otherwise read as the input's effect. None when
+        it cannot be told (the strict check then runs unmasked)."""
+        try:
+            time.sleep(self.SETTLE_POLL_S)
+            return _verify.unstable_mask(before, self._capture(),
+                                         self._strict_box(before))
+        except Exception as exc:
+            log.warning("act: pre-input stability probe failed: %s", exc)
+            return None
+
+    def _pixels_changed(self, before, after, ignore=None) -> bool:
+        """Did anything at all change? The strict check act() makes before it
+        re-sends (see ``verify.pixels_changed``), over the device's display
+        box -- never the brightness-detected face when the profile declares
+        one (it can sit on the bezel and miss the digit). Without any box
+        there is nothing trustworthy to compare, so it is not a proof of
+        change."""
+        box = self._strict_box(before)
+        if not box:
+            log.info("act: no display box; strict frame comparison skipped")
+            return False
+        try:
+            return _verify.pixels_changed(before, after, box, ignore=ignore)
+        except Exception as exc:
+            # Cannot compare: no proof the input landed, so the retry's
+            # original reasoning (a full settle window showed no effect) holds.
+            log.warning("act: full-resolution frame comparison failed: %s", exc)
+            return False
+
     # How long act() keeps looking for a gesture's effect before it decides the
     # gesture did not land. The simulator can take well over a second to
     # redraw after an input (a busy app, a cold JIT, a slow machine), and
@@ -645,6 +695,7 @@ class SimSession:
             self._resolve_button(button)      # unknown id: fail before any input
         last_reason = ""
         before = self._wait_stable() if confirm else None
+        unstable = self._unstable_mask(before) if before is not None else None
         # Aim at the display once: it does not move between attempts. An
         # unconfirmed gesture has no baseline, so take one frame for it -- but
         # only where gestures are aimed at the display (Windows).
@@ -681,6 +732,27 @@ class SimSession:
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(self.SETTLE_POLL_S)
+            # Before a re-send, prove the screen REALLY did not move. The test
+            # above is coarse on purpose and reads a one-digit change as none;
+            # re-sending a BACK that had landed took a HUD counter 0 -> 2 -> 5.
+            # A change is a landed gesture: report it as small (so `confirm`
+            # still says what it saw) and never send it again. With an anchor
+            # that OCR contradicted, the gesture still landed -- somewhere
+            # else -- so it fails without a re-send.
+            small = not changed and self._pixels_changed(before, after, unstable)
+            if changed or small:
+                log.info("act %s: %s change%s; not re-sending", kind,
+                         "small" if small else "screen",
+                         ", anchor not found" if anchor_ok is False else "")
+                if anchor_ok is False:
+                    return {"ok": False, "confirmed": False, "changed": True,
+                            "change": "small" if small else "large",
+                            "anchor": False, "attempts": attempt + 1,
+                            "reason": "screen changed but the anchor was not "
+                                      "found; not re-sent (it landed)"}
+                return {"ok": True, "confirmed": True, "changed": True,
+                        "change": "small", "anchor": anchor_ok,
+                        "attempts": attempt + 1}
             last_reason = f"no-change (changed={changed}, anchor={anchor_ok})"
             # The screen did not move, so `after` is still the baseline; keep
             # comparing against the original one.
@@ -848,7 +920,8 @@ class SimSession:
             # aimed at a screen we know we are not on.
             done.append({"ix": i, "kind": kind, "ok": bool(r.get("ok")),
                          "reason": r.get("reason")})
-            for extra in ("dismissed", "simulator_crashed", "state", "phoneConnected"):
+            for extra in ("dismissed", "simulator_crashed", "state", "phoneConnected",
+                          "change"):
                 if r.get(extra) is not None:
                     done[-1][extra] = r[extra]
             if not r.get("ok"):

@@ -160,3 +160,68 @@ def input_changed(before, after, face_sig, frame_detail, *,
     if signatures_differ(face_sig(before), face_sig(after)):
         return True
     return details_differ(frame_detail(before), frame_detail(after))
+
+
+# The last check before act() re-sends an input: did ANY pixel really move?
+# A pixel counts when its most-changed channel moved by PIXEL_LEVEL or more --
+# capture noise (a level or two, resampling wobble on a scaled Windows grab)
+# sits an order of magnitude under it, while text, even dark-grey on black, is
+# well over it. MIN_PIXELS ignores a stray pixel or two; one changed digit at
+# the smallest watch font still moves dozens.
+PIXEL_LEVEL = 24
+MIN_PIXELS = 4
+
+
+def unstable_mask(first, second, box=None, *, level: int = PIXEL_LEVEL, grow: int = 2):
+    """Pixels that moved between two frames taken with NO input in between,
+    grown by ``grow`` px so an element's antialiased edge and its next phase
+    are covered. ``pixels_changed`` ignores them: a blinking colon, a GPS dot
+    or a late-painting icon is not evidence that an input landed. None when
+    the frames cannot be compared (different sizes)."""
+    import numpy as np
+    if first.size != second.size:
+        return None
+    if box:
+        first, second = first.crop(box), second.crop(box)
+    a = np.asarray(first.convert("RGB"), dtype=np.int16)
+    b = np.asarray(second.convert("RGB"), dtype=np.int16)
+    moved = np.abs(a - b).max(axis=2) >= level
+    if not moved.any():
+        return moved
+    h, w = moved.shape
+    padded = np.pad(moved, grow)
+    grown = np.zeros_like(moved)
+    for dy in range(2 * grow + 1):
+        for dx in range(2 * grow + 1):
+            grown |= padded[dy:dy + h, dx:dx + w]
+    return grown
+
+
+def pixels_changed(before, after, box=None, *, level: int = PIXEL_LEVEL,
+                   min_pixels: int = MIN_PIXELS, ignore=None) -> bool:
+    """Did anything at all change between two frames, at full resolution?
+
+    ``input_changed`` is deliberately coarse -- it must not read a ticking
+    digit as a page turn -- so a gesture whose whole effect is one digit (a
+    BACK on a training HUD: attempts 0 -> 1) looked like a dropped input, was
+    re-sent, and the counter went 0 -> 2 -> 5. Re-sending is only safe on a
+    screen that is truly identical, which this checks. ``box`` (x0, y0, x1,
+    y1) limits the comparison to the watch display; without it the whole
+    frame is compared (outside the display it is static chrome). Frames of
+    different sizes cannot be compared, so they prove nothing: False, and the
+    caller falls back to the old re-send -- a check that cannot be made is
+    missing, not satisfied.
+    ``ignore`` (from ``unstable_mask``, same ``box``) drops pixels that were
+    already moving before the input was sent.
+    """
+    import numpy as np
+    if before.size != after.size:
+        return False
+    if box:
+        before, after = before.crop(box), after.crop(box)
+    a = np.asarray(before.convert("RGB"), dtype=np.int16)
+    b = np.asarray(after.convert("RGB"), dtype=np.int16)
+    moved = np.abs(a - b).max(axis=2) >= level
+    if ignore is not None and ignore.shape == moved.shape:
+        moved &= ~ignore
+    return int(moved.sum()) >= min_pixels
