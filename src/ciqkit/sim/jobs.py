@@ -5,16 +5,18 @@ their own chunk lists, and the numbers drifted: the same screen captured through
 ``ciqsim_shot`` and ``ciqkit sim shot`` got different settle times and budgets.
 Both now call these keyword-only builders, which take plain values -- no argparse
 namespaces -- so there is exactly one definition of what a "shot", "record",
-"nav" or "test" job is.
+"nav" or "test" job is. :func:`verdict` is the matching single definition of
+whether such a job passed.
 
 Stdlib-only, importing nothing but :mod:`.protocol`.
 """
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
-from .protocol import (DEFAULT_SHOT_SETTLE_S, Chunk, ChunkKind, Job, Priority,
-                       validate_job)
+from .protocol import (CHUNK_BUDGETS, DEFAULT_SHOT_SETTLE_S, E_WAIT_TIMEOUT, Chunk, ChunkKind,
+                       Job, JobState, Priority, error_code, validate_job)
 
 
 class JobError(ValueError):
@@ -22,21 +24,20 @@ class JobError(ValueError):
 
 
 # ── Budgets (seconds) ────────────────────────────────────────────────────────
-LOAD_EXPECTED_S = 40
-LOAD_MAX_S = 300
-SHOT_EXPECTED_S = 15.0
-SHOT_MAX_S = 120.0
+# Fixed budgets live in protocol.CHUNK_BUDGETS (one copy, shared with
+# Chunk.from_dict); these names stay for the builders and existing callers.
+LOAD_EXPECTED_S, LOAD_MAX_S = CHUNK_BUDGETS[ChunkKind.LOAD]
+SHOT_EXPECTED_S, SHOT_MAX_S = CHUNK_BUDGETS[ChunkKind.SHOT]
+ENSURE_EXPECTED_S, ENSURE_MAX_S = CHUNK_BUDGETS[ChunkKind.ENSURE]
 # nav runs every gesture in ONE chunk (it is stateful -- see SimSession.reach),
 # and each verified gesture costs a delay plus up to two retries. A fixed 120 s
 # meant a ten-step recipe timed out mid-nav and took a simulator restart with it.
 REACH_PER_STEP_S = 8.0
 REACH_MIN_MAX_S = 60.0
-RESTORE_EXPECTED_S = 1
-RESTORE_MAX_S = 30
+RESTORE_EXPECTED_S, RESTORE_MAX_S = CHUNK_BUDGETS[ChunkKind.RESTORE]
 RECORD_MIN_MAX_S = 60.0
-TEST_EXPECTED_S = 120
+TEST_EXPECTED_S, TEST_MAX_BUILD_S = CHUNK_BUDGETS[ChunkKind.TEST_BATCH]
 TEST_MAX_PRG_S = 600
-TEST_MAX_BUILD_S = 900
 
 
 def abs_path(project: str, path: str | None) -> str | None:
@@ -47,6 +48,47 @@ def abs_path(project: str, path: str | None) -> str | None:
     if not path:
         return path
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(project, path))
+
+
+def project_dir(raw: str | None, *, flag: str = "project", hint: str = "") -> str:
+    """The Connect IQ project directory ``raw`` names (default: cwd), validated.
+
+    One definition for the CLI and the MCP server: ``~`` is expanded (an MCP
+    client or a quoted ``--project "~/app"`` never gets a shell to do it), and a
+    wrong directory is refused here instead of surfacing later as a confusing
+    build error. ``flag``/``hint`` let each front-end word the refusal for what
+    its own user typed.
+    """
+    d = os.path.abspath(os.path.expanduser(raw or "."))
+    if not os.path.isdir(d):
+        raise JobError(f"{flag} directory does not exist: {d}")
+    if not os.path.isfile(os.path.join(d, "manifest.xml")):
+        raise JobError(f"{d} does not look like a Connect IQ project "
+                       f"(no manifest.xml).{hint}")
+    return d
+
+
+def app_name(project_dir: str) -> str:
+    """Short label for status output; also the broker's warm-app key."""
+    return os.path.basename(os.path.normpath(project_dir)) or "project"
+
+
+PRIORITIES = {"urgent": Priority.URGENT, "high": Priority.HIGH,
+              "normal": Priority.NORMAL, "batch": Priority.BATCH}
+
+
+def priority(name: str | None, urgent: bool = False) -> Priority:
+    """Priority for ``name`` (default normal); ``urgent`` wins. Unknown -> JobError.
+
+    Falling back silently turned a typo into URGENT on the MCP bump path."""
+    if urgent:
+        return Priority.URGENT
+    key = name or "normal"
+    try:
+        return PRIORITIES[key]
+    except KeyError:
+        raise JobError(f"unknown priority {key!r} "
+                       f"(expected one of: {', '.join(PRIORITIES)})") from None
 
 
 def refuse_seed_with_prg(seed, prg, *, seed_name="seed", prg_name="prg") -> None:
@@ -226,7 +268,7 @@ def nav_chunks(*, project, device, to, steps, prg=None, anchor=None, force=False
 def op_chunks(steps) -> list:
     """ENSURE REACH for simulator-level ops (``phone``, ``close_aux``) that need
     the simulator up but no particular app loaded."""
-    return [Chunk(ChunkKind.ENSURE, {}, expected_s=5.0, max_s=60.0),
+    return [Chunk(ChunkKind.ENSURE, {}, expected_s=ENSURE_EXPECTED_S, max_s=ENSURE_MAX_S),
             reach_chunk(screen="op", steps=steps)]
 
 
@@ -276,3 +318,152 @@ def make_job(*, app, device, priority=Priority.NORMAL, label="", chunks,
     if errs:
         raise JobError("; ".join(errs))
     return job
+
+
+# ── Verdicts ─────────────────────────────────────────────────────────────────
+# A finished job is not a passed one: the job completing only means its chunks
+# ran. Whether a shot matched its anchor, a nav reached its screen or a test run
+# passed is in the chunks' own results. The CLI turns that into an exit code
+# and the MCP tools into `ok`/`error`; both read it here, so the two front-ends
+# cannot drift apart again. Printing and JSON shaping stay with each front-end.
+#
+# The rules differ per command on purpose -- they are what each command has
+# always answered, pinned in tests/test_jobs.py:
+#   SHOT    (`shot`, `shot-on`, `wait`)  1 if the job failed; 3 when OCR ran and
+#           an expected anchor was NOT on screen (None = skipped, not failed).
+#   RECORD  1 if the job failed.
+#   NAV     1 if the job failed; then the reach step's verdict: 3 for a
+#           contradicted anchor, 1 for a gesture that did not land.
+#   TEST    1 if the job failed, or if the test run itself said ok=false (no
+#           verdict at all -- "Unable to connect", a crashed build, zero tests
+#           -- comes back as a DONE job carrying ok=false).
+#   OP      (`phone`, `close-aux`) 1 if the job failed.
+#   JOB     the MCP tools: not ok when the job failed or any chunk said ok=false.
+#   SCREEN  one row of `shots` / `ciqsim_shots`.
+# `ok` is what an MCP tool reports; for NAV it also folds in JOB's any-chunk
+# rule, which no CLI command applies.
+SHOT, RECORD, NAV, TEST, OP, JOB, SCREEN = (
+    "shot", "record", "nav", "test", "op", "job", "screen")
+VERDICT_COMMANDS = frozenset({SHOT, RECORD, NAV, TEST, OP, JOB, SCREEN})
+
+_TERMINAL = frozenset({JobState.DONE, JobState.FAILED, JobState.CANCELLED})
+
+
+@dataclass(frozen=True)
+class Verdict:
+    ok: bool
+    exit_code: int            # 0 passed · 1 failed · 3 an expected anchor was contradicted
+    reason: str | None = None  # human text for the failure; None when there is none
+    # A WAIT that timed out on a job that is still live. It keeps running and
+    # will still write its output: resubmitting it is the wrong reaction.
+    still_running: bool = False
+
+
+def _step_results(result: dict):
+    """(kind, result) of every chunk that ran; a null result reads as {}."""
+    for step in (result.get("job") or {}).get("results") or []:
+        yield step.get("kind"), step.get("result") or {}
+
+
+def _reach_failure(result: dict) -> tuple[int, str] | None:
+    for kind, res in _step_results(result):
+        if kind != ChunkKind.REACH:
+            continue
+        if res.get("anchor") is False:
+            return 3, (f"ran the steps but the target screen {res.get('screen')!r} "
+                       f"did not show the expected text")
+        if not res.get("ok"):
+            return 1, res.get("error", "nav did not reach the screen")
+    return None
+
+
+def _test_failure(result: dict) -> str | None:
+    for kind, res in _step_results(result):
+        if kind == ChunkKind.TEST_BATCH and not res.get("ok"):
+            why = res.get("reason") or (f"passed={res.get('passed')} "
+                                        f"failed={res.get('failed')} "
+                                        f"errors={res.get('errors')}")
+            return f"tests did not pass ({why})"
+    return None
+
+
+def _anchor_contradicted(result: dict) -> bool:
+    """True only when OCR ran and the expected text was NOT on a SHOT's screen.
+
+    ``None`` means OCR was unavailable or read nothing: a skipped check, not a
+    failed one -- failing there would break every machine without an OCR backend.
+    """
+    return any(kind == ChunkKind.SHOT and res.get("anchor") is False
+               for kind, res in _step_results(result))
+
+
+def _op_steps_failed(result: dict) -> bool:
+    # A results entry is {"kind", "result"}, and reach nests its `steps` under
+    # "result". The CLI used to read them one level up, where they never are, so
+    # `phone`/`close-aux` exited 0 after a failed step. Both levels are read.
+    for x in (result.get("job") or result).get("results") or []:
+        if not isinstance(x, dict):
+            continue
+        for holder in (x, x.get("result")):
+            steps = holder.get("steps") if isinstance(holder, dict) else None
+            if isinstance(steps, list) and not all(
+                    isinstance(st, dict) and st.get("ok") for st in steps):
+                return True
+    return False
+
+
+def _screen_verdict(r: dict, job: dict, r_ok: bool) -> tuple[bool, str | None]:
+    ok = r_ok
+    err = job.get("error") or (r.get("error") if not r_ok else None)
+    for kind, res in _step_results(r):
+        if kind == ChunkKind.SHOT and res.get("anchor") is False:
+            ok = False
+            err = err or "expected anchor text was not on screen"
+        elif kind == ChunkKind.REACH:
+            if res.get("anchor") is False:
+                ok = False
+                err = err or "steps ran but the screen did not show the expected text"
+            elif not res.get("ok"):
+                ok = False
+                err = err or res.get("error", "steps did not reach the screen")
+    return ok, (None if ok else err or "failed")
+
+
+def verdict(result: dict, command: str = JOB) -> Verdict:
+    """The verdict on a WAIT reply ``result`` for ``command`` (see the table above)."""
+    if command not in VERDICT_COMMANDS:
+        raise ValueError(f"no verdict rule for {command!r}")
+    r = result if isinstance(result, dict) else {}
+    job = r.get("job") or {}
+    r_ok = bool(r.get("ok"))
+    still = (error_code(r) == E_WAIT_TIMEOUT
+             and job.get("state") not in _TERMINAL)
+    job_err = job.get("error") or r.get("error")
+    any_step_failed = any(res.get("ok") is False for _, res in _step_results(r))
+
+    if command == JOB:
+        ok = r_ok and not any_step_failed
+        return Verdict(ok, 0 if ok else 1, job_err, still)
+    if command == SCREEN:
+        ok, err = _screen_verdict(r, job, r_ok)
+        return Verdict(ok, 0 if ok else 1, err, still)
+    if command == NAV:
+        fail = _reach_failure(r)
+        code = 1 if not r_ok else (fail[0] if fail else 0)
+        ok = r_ok and not any_step_failed and not fail
+        return Verdict(ok, code, fail[1] if fail else job_err, still)
+    if command == TEST:
+        why = _test_failure(r)
+        code = 0 if r_ok and not why else 1
+        return Verdict(code == 0, code, why or (job_err if code else None), still)
+    if command == SHOT:
+        contradicted = _anchor_contradicted(r)
+        code = 1 if not r_ok else (3 if contradicted else 0)
+        reason = ("expected anchor text was not on screen" if contradicted
+                  else job_err if code else None)
+        return Verdict(code == 0, code, reason, still)
+    if command == OP:
+        code = 0 if r_ok and not _op_steps_failed(r) else 1
+    else:                                   # RECORD
+        code = 0 if r_ok else 1
+    return Verdict(code == 0, code, job_err if code else None, still)

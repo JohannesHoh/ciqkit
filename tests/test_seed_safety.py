@@ -140,6 +140,34 @@ def test_a_project_outside_git_still_seeds(session, project):
     assert "const SEED_DEMO = true;" in (project / "source" / "Constants.mc").read_text()
 
 
+def test_a_git_that_does_not_answer_is_bounded_and_refused(session, project, monkeypatch):
+    """The git calls had no timeout: an index lock or a prompt held the SEED
+    chunk -- and a restore, on the broker's scheduler thread -- indefinitely.
+    A git that does not answer is "unknown", which the guard does not read as
+    clean."""
+    from ciqkit.sim import seed as seed_mod
+    seen = []
+
+    def hung(argv, **kw):
+        seen.append(kw.get("timeout"))
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+    monkeypatch.setattr(seed_mod._compat, "run_killing_tree", hung)
+    with pytest.raises(SimError, match="did not answer"):
+        session.seed(str(project), {"SEED_DEMO": "true"})
+    assert seen and all(t == seed_mod.GIT_TIMEOUT_S for t in seen), seen
+    assert "const SEED_DEMO = false;" in (project / "source" / "Constants.mc").read_text()
+    assert seed_mod._git_clean(str(project / "source" / "Constants.mc")) is False
+
+
+def test_a_git_timeout_reads_as_unknown(tmp_path, monkeypatch):
+    from ciqkit.sim import seed as seed_mod
+
+    def hung(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+    monkeypatch.setattr(seed_mod._compat, "run_killing_tree", hung)
+    assert seed_mod._git_status(str(tmp_path / "f.mc")) == "unknown"
+
+
 # ── the crash-safe journal ────────────────────────────────────────────────────
 
 def test_the_journal_is_written_before_the_tree_is_touched(session, project):

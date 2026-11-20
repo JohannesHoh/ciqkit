@@ -44,6 +44,15 @@ from .protocol import DEFAULT_PLAYBACK_MS, Job, ChunkKind, Priority
 SPAWN_WAIT_S = float(os.environ.get("CIQSIM_SPAWN_WAIT_S", "20"))
 
 
+# Read timeout for ops the broker answers at once (status, ping, bump, cancel,
+# submit, shutdown). A wedged broker then fails in seconds rather than the ~10
+# minutes a blocking WAIT may legitimately take; only `wait` passes its own.
+# Shorter than ZOMBIE_GRACE_S on purpose: the broker answers these under its
+# lock, and its scheduler never holds that lock across a session call -- seed
+# restores included (see Broker._restore_now) -- so no answer waits on the GUI.
+CHEAP_RPC_TIMEOUT_S = 10.0
+
+
 class BrokerNotRunning(OSError):
     """Nothing is listening on the control socket.
 
@@ -51,6 +60,30 @@ class BrokerNotRunning(OSError):
     both OSError, and reporting the second as the first sends the user looking
     for a broker that was there a moment ago.
     """
+
+
+class BrokerError(RuntimeError):
+    """The broker answered with an error reply.
+
+    ``code`` is one of ``protocol.ERROR_CODES`` -- branch on it, never on the
+    message, which is human text. ``reply`` is the whole answer, for a caller
+    that prints it. A RuntimeError because that is what a refused SUBMIT always
+    raised, and the per-screen loops of ``shots`` still catch it as one.
+    """
+
+    def __init__(self, code: str, message: str, reply: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.reply = reply if reply is not None else proto.error_reply(code, message)
+
+
+def _check(r: dict, *, allow=()) -> dict:
+    """``r`` itself, unless it is an error reply whose code is not in ``allow``."""
+    code = proto.error_code(r)
+    if code is not None and code not in allow:
+        raise BrokerError(code, str(r.get("error")), r)
+    return r
 
 
 class Client:
@@ -88,36 +121,45 @@ class Client:
                 "for the full picture, or read the log at "
                 f"{os.path.join(proto.runtime_dir(), 'brokerd.log')}") from None
 
-    def _rpc(self, req: dict, read_timeout: float = 630.0) -> dict:
+    def _rpc(self, req: dict, read_timeout: float | None = None) -> dict:
         s = self._connect()
         try:
-            s.settimeout(read_timeout)
+            s.settimeout(CHEAP_RPC_TIMEOUT_S if read_timeout is None else read_timeout)
             s.sendall(proto.dumps(req))
             f = s.makefile("rb")
             line = f.readline()
-            return proto.loads(line) if line else {"ok": False, "error": "no response"}
+            if not line:
+                # The broker closed the connection without answering: it died
+                # or was killed mid-request.
+                return proto.error_reply(proto.E_INTERNAL, "no response")
+            return proto.loads(line)
         finally:
             s.close()
 
-    # library API
+    # library API. Every op raises BrokerError on an error reply; the dict it
+    # returns is a success -- or, from wait(), a finished job (which may have
+    # failed: its verdict is jobs.verdict's) or a wait timeout, whose reply
+    # carries the still-running job.
     def ping(self) -> dict:
-        return self._rpc({"op": proto.Op.PING})
+        return _check(self._rpc({"op": proto.Op.PING}))
 
     def submit(self, job: Job) -> str:
         r = self._rpc({"op": proto.Op.SUBMIT, "job": job.to_dict()})
-        if not r.get("ok") and r.get("error") == proto.ERR_SHUTTING_DOWN:
+        if proto.error_code(r) == proto.E_SHUTTING_DOWN:
             # Reached a broker on its way out (e.g. right after `sim shutdown`).
             # Let it finish exiting, then submit again: the connect autospawns
             # a fresh one.
             self.wait_gone()
             r = self._rpc({"op": proto.Op.SUBMIT, "job": job.to_dict()})
+        _check(r)
         if not r.get("ok"):
-            raise RuntimeError(r.get("error", "submit failed"))
+            raise BrokerError(proto.E_INTERNAL, "submit failed", r)
         return r["job_id"]
 
     def wait(self, job_id: str, timeout_s: float = 600.0) -> dict:
-        return self._rpc({"op": proto.Op.WAIT, "job_id": job_id,
-                          "timeout_s": timeout_s}, read_timeout=timeout_s + 30)
+        return _check(self._rpc({"op": proto.Op.WAIT, "job_id": job_id,
+                                 "timeout_s": timeout_s}, read_timeout=timeout_s + 30),
+                      allow=(proto.E_WAIT_TIMEOUT,))
 
     def submit_wait(self, job: Job, timeout_s: float | None = None) -> dict:
         """Submit and wait. ``timeout_s`` defaults to :func:`jobs.wait_budget`,
@@ -126,13 +168,14 @@ class Client:
         return self.wait(jid, timeout_s or jobs.wait_budget(job))
 
     def status(self) -> dict:
-        return self._rpc({"op": proto.Op.STATUS})
+        return _check(self._rpc({"op": proto.Op.STATUS}))
 
     def bump(self, job_id: str, priority: int = Priority.URGENT) -> dict:
-        return self._rpc({"op": proto.Op.BUMP, "job_id": job_id, "priority": priority})
+        return _check(self._rpc({"op": proto.Op.BUMP, "job_id": job_id,
+                                 "priority": priority}))
 
     def cancel(self, job_id: str) -> dict:
-        return self._rpc({"op": proto.Op.CANCEL, "job_id": job_id})
+        return _check(self._rpc({"op": proto.Op.CANCEL, "job_id": job_id}))
 
     def shutdown(self, wait_s: float = 30.0) -> dict:
         """Stop the broker and return once it has actually exited.
@@ -144,7 +187,7 @@ class Client:
         spawned one, came back "no such job". ``stopped`` says whether it
         exited within ``wait_s``.
         """
-        r = self._rpc({"op": proto.Op.SHUTDOWN})
+        r = _check(self._rpc({"op": proto.Op.SHUTDOWN}))
         if r.get("ok"):
             r["stopped"] = self.wait_gone(wait_s)
         return r
@@ -297,45 +340,30 @@ def spawn_daemon(sock_path: str | None = None):
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-_PRIO = {"urgent": Priority.URGENT, "high": Priority.HIGH,
-         "normal": Priority.NORMAL, "batch": Priority.BATCH}
-
-
 def _prio(args) -> int:
-    if getattr(args, "urgent", False):
-        return Priority.URGENT
-    return _PRIO.get(getattr(args, "priority", "normal") or "normal", Priority.NORMAL)
+    return jobs.priority(getattr(args, "priority", None), getattr(args, "urgent", False))
 
 
 def _project_dir(args) -> str:
     """The Connect IQ project directory this job targets.
 
     Defaults to the current directory, so the common case is just running the
-    command from inside your project. Validated up front: pointing at the wrong
-    directory otherwise surfaces much later as a confusing build error.
+    command from inside your project.
     """
-    d = os.path.abspath(getattr(args, "project", None) or ".")
-    if not os.path.isdir(d):
-        raise SystemExit(f"error: --project directory does not exist: {d}")
-    if not os.path.isfile(os.path.join(d, "manifest.xml")):
-        raise SystemExit(
-            f"error: {d} does not look like a Connect IQ project "
-            f"(no manifest.xml). Pass --project <dir>, or run from inside the "
-            f"project.")
-    return d
+    try:
+        return jobs.project_dir(
+            getattr(args, "project", None), flag="--project",
+            hint=" Pass --project <dir>, or run from inside the project.")
+    except jobs.JobError as e:
+        raise SystemExit(f"error: {e}") from None
 
 
 def _project_name(project_dir: str) -> str:
-    """Short label for status output; also the broker's warm-app key."""
-    return os.path.basename(os.path.normpath(project_dir)) or "project"
+    return jobs.app_name(project_dir)
 
 
 def _abs(project_dir, path):
-    if not path:
-        return path
-    # normpath: on Windows `--prg bin/App.prg` would otherwise reach monkeydo
-    # as `C:\proj\bin/App.prg`, and the storage journal keys on that string.
-    return os.path.normpath(path if os.path.isabs(path) else os.path.join(project_dir, path))
+    return jobs.abs_path(project_dir, path)
 
 
 def build_parser(prog="ciqkit sim"):
@@ -365,7 +393,7 @@ def build_parser(prog="ciqkit sim"):
                         help="after the verified load, start the simulator's FIT "
                              "playback of this .fit/.gpx file (Simulation > "
                              "Activity Data) and verify it is playing. macOS only.")
-        sp.add_argument("--priority", choices=list(_PRIO))
+        sp.add_argument("--priority", choices=list(jobs.PRIORITIES))
         sp.add_argument("--urgent", action="store_true",
                         help="shorthand for --priority urgent")
         sp.add_argument("--force", action="store_true",
@@ -479,19 +507,19 @@ def build_parser(prog="ciqkit sim"):
     sp.add_argument("--timeout", type=float, default=600.0, metavar="SECONDS")
     sp = sub.add_parser("bump", help="raise a queued job's priority")
     sp.add_argument("job_id")
-    sp.add_argument("--priority", choices=list(_PRIO), default="urgent")
+    sp.add_argument("--priority", choices=list(jobs.PRIORITIES), default="urgent")
     sp = sub.add_parser("cancel", help="cancel a job")
     sp.add_argument("job_id")
     sp = sub.add_parser(
         "phone", help="set the simulated phone link (Settings > Connection Type "
                       "> BLE); DeviceSettings.phoneConnected follows it")
     sp.add_argument("state", choices=["connected", "disconnected"])
-    sp.add_argument("--priority", choices=list(_PRIO))
+    sp.add_argument("--priority", choices=list(jobs.PRIORITIES))
     sp.add_argument("--urgent", action="store_true")
     sp = sub.add_parser(
         "close-aux", help="close the simulator's auxiliary windows (the "
                           "openWebPage web view, panels) and stray alerts")
-    sp.add_argument("--priority", choices=list(_PRIO))
+    sp.add_argument("--priority", choices=list(jobs.PRIORITIES))
     sp.add_argument("--urgent", action="store_true")
     sub.add_parser("shutdown", help="stop the broker daemon")
     sub.add_parser("ping", help="check whether the broker is alive")
@@ -533,11 +561,16 @@ def main(argv=None):
             return _read_only(c, args)
         except BrokerNotRunning:
             return _not_running(args.cmd)
+        except BrokerError as e:
+            return _refused(e, indent=2 if args.cmd == "wait" else None)
     if args.cmd == "restore":
         return _restore()
 
     if args.cmd in ("phone", "close-aux"):
-        return _sim_op(c, args)
+        try:
+            return _sim_op(c, args)
+        except BrokerError as e:
+            return _refused(e)
 
     proj = _project_dir(args)
     name = _project_name(proj)
@@ -555,6 +588,15 @@ def main(argv=None):
         return _run_job_command(c, args, proj, name)
     except jobs.JobError as exc:     # a builder or make_job refused the job locally
         raise SystemExit(f"error: {exc}") from exc
+    except BrokerError as e:          # the broker refused it, or lost it before the WAIT
+        return _refused(e)
+
+
+def _refused(e: BrokerError, indent: int | None = 2) -> int:
+    """The broker answered with an error (``no such job``, an invalid job...).
+    stdout carries its reply as JSON, as for every other answer; exit 1."""
+    print(json.dumps(e.reply, indent=indent))
+    return 1
 
 
 def _sim_op(c: Client, args) -> int:
@@ -563,20 +605,23 @@ def _sim_op(c: Client, args) -> int:
         steps = [{"kind": "phone", "state": args.state}]
     else:
         steps = [{"kind": "close_aux"}]
-    args.device = getattr(args, "device", None) or "venu3"
+    args.device = getattr(args, "device", None) or proto.DEFAULT_DEVICE
     job = _mkjob(args, "(simulator)", jobs.op_chunks(steps), args.cmd)
     r = c.submit_wait(job)
     print(json.dumps(r, indent=2))
-    return 0 if r.get("ok") and _op_steps_ok(r) else 1
+    return jobs.verdict(r, jobs.OP).exit_code
 
 
-def _op_steps_ok(r) -> bool:
-    res = (r.get("job") or r).get("results") or []
-    for x in res:
-        if isinstance(x, dict) and isinstance(x.get("steps"), list):
-            if not all(st.get("ok") for st in x["steps"]):
-                return False
-    return True
+def _exit(r: dict, command: str, *, explain: bool = False) -> int:
+    """Exit code from :func:`jobs.verdict`. A failed or timed-out WAIT gets the
+    still-running hint; ``explain`` puts the step's own reason on stderr when
+    the job ran but did not do what was asked (nav, test)."""
+    v = jobs.verdict(r, command)
+    if not r.get("ok"):
+        _hint_if_still_running(r)
+    elif v.exit_code and explain:
+        print(f"error: {v.reason}", file=sys.stderr)
+    return v.exit_code
 
 
 def _run_job_command(c: Client, args, proj, name) -> int:
@@ -586,10 +631,7 @@ def _run_job_command(c: Client, args, proj, name) -> int:
                             out_dir=args.out_dir)
         r = c.submit_wait(job, timeout_s=args.max)
         print(json.dumps(r, indent=2))
-        if not r.get("ok"):
-            _hint_if_still_running(r)
-            return 1
-        return 0 if _anchor_ok(r) else 3
+        return _exit(r, jobs.SHOT)
 
     if args.cmd == "shot-on":
         shots = []
@@ -606,10 +648,7 @@ def _run_job_command(c: Client, args, proj, name) -> int:
         job = _mkjob(args, name, chunks, f"shot-on {len(shots)}")
         r = c.submit_wait(job, timeout_s=args.max)
         print(json.dumps(r, indent=2))
-        if not r.get("ok"):
-            _hint_if_still_running(r)
-            return 1
-        return 0 if _anchor_ok(r) else 3
+        return _exit(r, jobs.SHOT)
 
     if args.cmd == "record":
         chunks = jobs.record_chunks(
@@ -624,10 +663,7 @@ def _run_job_command(c: Client, args, proj, name) -> int:
         job = _mkjob(args, name, chunks, f"record {args.name}")
         r = c.submit_wait(job, timeout_s=args.max)
         print(json.dumps(r, indent=2))
-        if r.get("ok"):
-            return 0
-        _hint_if_still_running(r)
-        return 1
+        return _exit(r, jobs.RECORD)
 
     if args.cmd == "nav":
         try:
@@ -643,10 +679,7 @@ def _run_job_command(c: Client, args, proj, name) -> int:
         job = _mkjob(args, name, chunks, f"nav {args.to}")
         r = c.submit_wait(job, timeout_s=args.max)
         print(json.dumps(r, indent=2))
-        if not r.get("ok"):
-            _hint_if_still_running(r)
-            return 1
-        return _nav_exit(r)
+        return _exit(r, jobs.NAV, explain=True)
 
     if args.cmd == "test":
         job = _mkjob(args, name,
@@ -655,10 +688,7 @@ def _run_job_command(c: Client, args, proj, name) -> int:
                      f"test {name}", default_prio=Priority.BATCH)
         r = c.submit_wait(job, timeout_s=args.max)
         print(json.dumps(r, indent=2))
-        if not r.get("ok"):
-            _hint_if_still_running(r)
-            return 1
-        return _tests_exit(r)
+        return _exit(r, jobs.TEST, explain=True)
 
     return 2
 
@@ -676,15 +706,13 @@ def _read_only(c: Client, args) -> int:
     if args.cmd == "wait":
         r = c.wait(args.job_id, args.timeout)
         print(json.dumps(r, indent=2))
-        if not r.get("ok"):
-            _hint_if_still_running(r)
-            return 1
-        return 0 if _anchor_ok(r) else 3
+        return _exit(r, jobs.SHOT)
     if args.cmd in ("bump", "cancel"):
         # Exit on what the broker actually said. `no such job` -- which
         # retention reaping now makes routine for anything older than 15
-        # minutes -- must not exit 0 while the JSON on stdout says it failed.
-        r = (c.bump(args.job_id, _PRIO[args.priority]) if args.cmd == "bump"
+        # minutes -- must not exit 0 while the JSON on stdout says it failed:
+        # it raises BrokerError, which main() prints and exits 1 on.
+        r = (c.bump(args.job_id, jobs.PRIORITIES[args.priority]) if args.cmd == "bump"
              else c.cancel(args.job_id))
         print(json.dumps(r))
         return 0 if r.get("ok") else 1
@@ -698,6 +726,8 @@ def _read_only(c: Client, args) -> int:
                 c.ping()
             except (BrokerNotRunning, OSError):
                 break
+            except BrokerError:
+                pass                    # still there (e.g. out of slots): keep waiting
             time.sleep(0.2)
         print(json.dumps(r))
         return 0
@@ -762,72 +792,12 @@ def _hint_if_still_running(r: dict):
     """A wait timeout is not a cancellation: the job keeps running and will
     still write its output. Say so, and say how to collect it -- otherwise the
     printed job id is a dead end. Goes to stderr; stdout carries the JSON."""
-    if r.get("error") != "wait timeout":
+    if proto.error_code(r) != proto.E_WAIT_TIMEOUT:
         return
     job = r.get("job") or {}
     print(f"\nnote: job {job.get('id')} is still {job.get('state')} — it keeps "
           f"running and will still produce its output.\n"
           f"  re-attach with: ciqkit sim wait {job.get('id')}", file=sys.stderr)
-
-
-def _nav_exit(result) -> int:
-    """Exit code for `nav`, from the reach step's own verdict.
-
-    The job completing only means the chunks ran. `nav` exists to answer "did I
-    reach that screen", so reporting 0 while the reach said otherwise makes the
-    command worthless -- and quiet about it. Codes match `shot`: 3 when an
-    anchor was explicitly contradicted, 1 when a gesture did not land.
-    """
-    for step in result.get("job", {}).get("results", []):
-        if step.get("kind") != ChunkKind.REACH:
-            continue
-        res = step.get("result") or {}
-        if res.get("anchor") is False:
-            print(f"error: ran the steps but the target screen "
-                  f"{res.get('screen')!r} did not show the expected text",
-                  file=sys.stderr)
-            return 3
-        if not res.get("ok"):
-            print(f"error: {res.get('error', 'nav did not reach the screen')}",
-                  file=sys.stderr)
-            return 1
-    return 0
-
-
-def _tests_exit(result) -> int:
-    """Exit code for `test`, from the test run's own verdict.
-
-    The job finishing only means the chunk ran. A run with no verdict --
-    "Unable to connect to simulator.", a test build that crashed on load,
-    zero tests -- comes back as a DONE job carrying ``ok: false``, and
-    exiting 0 on the job alone called every one of those green. Scripts and
-    CI gate on this code, so it has to be the tests' answer.
-    """
-    for step in result.get("job", {}).get("results", []):
-        if step.get("kind") != ChunkKind.TEST_BATCH:
-            continue
-        res = step.get("result") or {}
-        if not res.get("ok"):
-            why = res.get("reason") or (f"passed={res.get('passed')} "
-                                        f"failed={res.get('failed')} "
-                                        f"errors={res.get('errors')}")
-            print(f"error: tests did not pass ({why})", file=sys.stderr)
-            return 1
-    return 0
-
-
-def _anchor_ok(result) -> bool:
-    """False only when OCR ran and the expected text was NOT on screen.
-
-    `None` means OCR is unavailable or returned nothing, in which case the
-    anchor is a skipped check rather than a failed one -- failing there would
-    break every machine without an OCR backend installed.
-    """
-    for step in result.get("job", {}).get("results", []):
-        if step.get("kind") == ChunkKind.SHOT:
-            if (step.get("result") or {}).get("anchor") is False:
-                return False
-    return True
 
 
 def _mkjob_screen(args, proj, app, name, *, anchor=None, seed=None, steps=None,
@@ -891,28 +861,18 @@ def _shots(c: Client, args, proj, app, cfg) -> int:
 
 
 def screen_summary(name: str, r: dict) -> dict:
-    """Per-screen verdict from a finished shot job (shared with the MCP tool)."""
+    """Per-screen row from a finished shot job (shared with the MCP tool); the
+    verdict itself is :func:`jobs.verdict`'s SCREEN rule."""
     job = r.get("job") or {}
-    row = {"screen": name, "ok": bool(r.get("ok")), "path": None,
-           "job_id": job.get("id")}
-    err = job.get("error") or (r.get("error") if not r.get("ok") else None)
+    v = jobs.verdict(r, jobs.SCREEN)
+    row = {"screen": name, "ok": v.ok, "path": None, "job_id": job.get("id")}
     for step in job.get("results", []):
-        res = step.get("result") or {}
         if step.get("kind") == ChunkKind.SHOT:
+            res = step.get("result") or {}
             row["path"] = res.get("path")
             row["anchor"] = res.get("anchor")
-            if res.get("anchor") is False:
-                row["ok"] = False
-                err = err or "expected anchor text was not on screen"
-        elif step.get("kind") == ChunkKind.REACH:
-            if res.get("anchor") is False:
-                row["ok"] = False
-                err = err or "steps ran but the screen did not show the expected text"
-            elif not res.get("ok"):
-                row["ok"] = False
-                err = err or res.get("error", "steps did not reach the screen")
-    if not row["ok"]:
-        row["error"] = err or "failed"
+    if not v.ok:
+        row["error"] = v.reason
     return row
 
 

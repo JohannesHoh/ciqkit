@@ -45,7 +45,6 @@ import logging
 import os
 import sys
 import time
-import shutil
 import subprocess
 import tempfile
 
@@ -76,6 +75,15 @@ from .framing import (               # noqa: F401  -- re-exported API
     looks_like_app_loaded, sim_display_box,
     sim_device_keys, sim_device_point, sim_button_point,
     frame_device_art_capture, make_framed_screenshot, make_sdk_framed_screenshot,
+)
+from .fit_panel import (             # noqa: F401  -- re-exported API
+    FIT_STAGE_DIR, _BLE_MENU, _fit_osascript, read_fit_playback,
+    read_phone_connection, set_phone_connection, stage_fit_for_panel,
+    start_fit_playback,
+)
+from .simctl import (                # noqa: F401  -- re-exported API
+    _MONKEYDO_CHILDREN, _kill_monkeydo_trees_win, _kill_orphan_monkeydo,
+    _pkill_best_effort, _restart_simulator, ensure_simulator,
 )
 
 # A library must not write to stdout: callers parse it, and the MCP server
@@ -942,14 +950,18 @@ def _dismiss_system_alerts() -> int:
         return 0
     n = 0
     for pn, wi, btn in _plan_alert_clicks(r.stdout):
+        # Process and button names come from the scan, so they travel as argv
+        # items, never inside the script text (a quote would break the script).
         script = (
-            'tell application "System Events"\n'
-            f'    tell (first process whose name is "{pn}")\n'
-            f'        click button "{btn}" of window {wi}\n'
+            'on run argv\n'
+            '    tell application "System Events"\n'
+            '        tell (first process whose name is (item 1 of argv))\n'
+            f'            click button (item 2 of argv) of window {int(wi)}\n'
+            '        end tell\n'
             '    end tell\n'
-            'end tell')
+            'end run')
         try:
-            subprocess.run(["osascript", "-e", script], capture_output=True,
+            subprocess.run(["osascript", "-e", script, "--", pn, btn], capture_output=True,
                            text=True, timeout=3)
             n += 1
             time.sleep(0.15)
@@ -958,160 +970,16 @@ def _dismiss_system_alerts() -> int:
     return n
 
 
-_BLE_MENU = ('tell menu 1 of menu bar item "Settings" of menu bar 1'
-             ' to tell menu item "Connection Type" to tell menu 1'
-             ' to tell menu item "BLE" to tell menu 1')
-
-
-def read_phone_connection():
-    """The checked item of Settings > Connection Type > BLE ("Connected",
-    "Not Connected", "Not Initialized"), or None if unreadable / not macOS."""
-    if not IS_MAC:
-        return None
-    script = (
-        'set FS to (ASCII character 31)\n'
-        'tell application "System Events" to tell (first process whose name is "simulator")\n'
-        f'    {_BLE_MENU}\n'
-        '        set out to ""\n'
-        '        repeat with mi in menu items\n'
-        '            set ch to ""\n'
-        '            try\n'
-        '                set ch to value of attribute "AXMenuItemMarkChar" of mi\n'
-        '            end try\n'
-        '            if ch is missing value then set ch to ""\n'
-        '            set out to out & (name of mi) & FS & ch & linefeed\n'
-        '        end repeat\n'
-        '        return out\n'
-        '    end tell\n'
-        'end tell')
+def _osascript_best_effort(script: str, what: str, *args: str, timeout: float = 10) -> None:
+    """Run a GUI osascript step that must not hang or abort a capture in progress."""
     try:
-        r = subprocess.run(["osascript", "-e", script], capture_output=True,
-                           text=True, timeout=6)
-    except Exception:
-        return None
-    return _sw.parse_marked_item(r.stdout)
-
-
-def set_phone_connection(state) -> dict:
-    """Set the simulated phone link (macOS): Settings > Connection Type > BLE >
-    Connected / Not Connected, then read the menu back. ``DeviceSettings.
-    phoneConnected`` follows it. Returns {ok, requested, state, changed}."""
-    want = _sw.phone_menu_item(state)
-    if not IS_MAC:
-        return {"ok": False, "requested": want, "state": None,
-                "error": "phone connection control is implemented for macOS only"}
-    before = read_phone_connection()
-    if before != want:
-        script = (
-            'tell application "System Events" to tell (first process whose name is "simulator")\n'
-            f'    {_BLE_MENU}\n'
-            f'        click menu item "{want}"\n'
-            '    end tell\n'
-            'end tell')
-        try:
-            subprocess.run(["osascript", "-e", script], capture_output=True,
-                           text=True, timeout=6)
-        except Exception:
-            pass
-        time.sleep(0.5)
-    after = read_phone_connection()
-    return {"ok": after == want, "requested": want, "state": after,
-            "changed": before != after, "previous": before}
-
-
-def _fit_osascript(script: str, *args, timeout: float = 30) -> dict:
-    r = subprocess.run(["osascript", "-e", script, *args], capture_output=True,
-                       text=True, timeout=timeout)
-    if r.returncode != 0:
-        return {"error": (r.stderr or "osascript failed").strip()}
-    return _sw.parse_fit_state(r.stdout)
-
-
-def read_fit_playback() -> dict:
-    """The Activity Data window's state ({source, file, elapsed_s, total_s}), or
-    {error}. macOS only."""
-    if not IS_MAC:
-        return {"error": "FIT playback control is implemented for macOS only"}
-    return _fit_osascript(_sw.FIT_STATE_SCRIPT, "state")
-
-
-#: Where FIT/GPX files are copied before the file panel loads them (see stage_fit_for_panel).
-FIT_STAGE_DIR = os.path.join(os.path.expanduser("~"), "Library", "Caches", "ciqkit", "fit")
-
-
-def stage_fit_for_panel(path: str, stage_dir: str = None) -> str:
-    """The path to type into the file panel's Go-to-folder sheet for ``path``.
-
-    The panel will not open a file under the per-user temp dir (``/var/folders/..``,
-    where ``tempfile``/``os.tmpdir()`` put files, either spelling): the sheet takes
-    the path but the window stays empty (2026-11-12, SDK 9.1.0; a home or ``/tmp``
-    path loads). Such a file is copied to ``FIT_STAGE_DIR`` under its own name, and
-    that copy is loaded; any other path is returned unchanged.
-    """
-    real = os.path.realpath(path)
-    if not (real.startswith("/private/var/folders/") or real.startswith("/var/folders/")):
-        return path
-    stage_dir = stage_dir or FIT_STAGE_DIR
-    os.makedirs(stage_dir, exist_ok=True)
-    dst = os.path.join(stage_dir, os.path.basename(path))
-    shutil.copyfile(real, dst)
-    return dst
-
-
-def start_fit_playback(path: str, advance_s: float = 12.0,
-                       close_window: bool = True) -> dict:
-    """Simulation > Activity Data > FIT/GPX Playable File: load ``path`` and press
-    play, then VERIFY it: the window must show that file, and its playback clock
-    must have advanced. ``ok`` is False otherwise, with a ``reason``.
-
-    Returns {ok, file, total_s, elapsed_s, reason?}. macOS only.
-    """
-    path = os.path.abspath(os.path.expanduser(path))
-    res = {"ok": False, "file": path}
-    if not IS_MAC:
-        res["reason"] = "FIT playback control is implemented for macOS only"
-        return res
-    if not os.path.isfile(path):
-        res["reason"] = f"no such file: {path}"
-        return res
-    path = stage_fit_for_panel(path)
-    try:
-        r = subprocess.run(["osascript", "-e", _sw.FIT_LOAD_SCRIPT, path],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0 or r.stdout.strip().startswith("ERR"):
-            res["reason"] = (r.stdout or r.stderr).strip() or "load script failed"
-            return res
-        st = _fit_osascript(_sw.FIT_STATE_SCRIPT, "state")
-        if st.get("error"):
-            res["reason"] = st["error"]
-            return res
-        if st.get("file") != path:
-            res["reason"] = (f"the playback window shows {st.get('file')!r}, not the "
-                             f"requested file (the file panel did not take the path)")
-            return res
-        res["total_s"] = st.get("total_s")
-        st = _fit_osascript(_sw.FIT_STATE_SCRIPT, "play")
-        deadline = time.monotonic() + advance_s
-        while not st.get("error") and not (st.get("elapsed_s") or 0) > 0:
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.7)
-            st = _fit_osascript(_sw.FIT_STATE_SCRIPT, "state")
-        if st.get("error"):
-            res["reason"] = st["error"]
-            return res
-        res["elapsed_s"] = st.get("elapsed_s")
-        if not (st.get("elapsed_s") or 0) > 0:
-            res["reason"] = (f"playback clock did not advance within {advance_s:.0f}s "
-                             f"(stuck at {st.get('elapsed_s')})")
-            return res
-        res["ok"] = True
-        if close_window:
-            # the panel sits over the watch face; playback goes on without it
-            _fit_osascript(_sw.FIT_STATE_SCRIPT, "close")
+        # "--" ends osascript's own options: without it a key such as "-x" is read as
+        # an osascript flag, the call exits 2 and the keystroke is silently dropped.
+        subprocess.run(["osascript", "-e", script, "--", *args], capture_output=True,
+                       timeout=timeout)
     except subprocess.TimeoutExpired:
-        res["reason"] = "System Events did not answer while driving the Activity Data window"
-    return res
+        # best effort: a wedged System Events costs this step, not the capture
+        log.warning("%s: osascript timed out after %ss", what, timeout)
 
 
 def find_sim_window():
@@ -1169,7 +1037,7 @@ def restore_window(hwnd) -> None:
             '    end if\n'
             'end tell'
         )
-        subprocess.run(["osascript", "-e", script], capture_output=True)
+        _osascript_best_effort(script, "restore_window")
 
 
 def dismiss_modal_dialogs(verbose=False):
@@ -1318,7 +1186,7 @@ def focus_window(hwnd) -> None:
             '    end if\n'
             'end tell'
         )
-        subprocess.run(["osascript", "-e", script], capture_output=True)
+        _osascript_best_effort(script, "focus_window")
         time.sleep(0.3)
 # Screenshot capture
 # ---------------------------------------------------------------------------
@@ -1849,8 +1717,11 @@ def phys_key(hwnd, key, delay=1.5, modifiers=None):
         if key in keycode_map:
             action = f"key code {keycode_map[key]}{using_clause}"
         else:
-            action = f'keystroke "{key}"{using_clause}'
+            # The key is argv, not script text: a quote in it would be a script
+            # error whose return code nobody reads.
+            action = f'keystroke (item 1 of argv){using_clause}'
         script = (
+            'on run argv\n'
             'tell application "System Events"\n'
             '    set procs to (processes whose name is "simulator")\n'
             '    if (count of procs) > 0 then\n'
@@ -1858,9 +1729,10 @@ def phys_key(hwnd, key, delay=1.5, modifiers=None):
             '        delay 0.15\n'
             f'        {action}\n'
             '    end if\n'
-            'end tell'
+            'end tell\n'
+            'end run'
         )
-        subprocess.run(["osascript", "-e", script], capture_output=True)
+        _osascript_best_effort(script, "phys_key", str(key))
         time.sleep(delay)
         return
 
@@ -1879,199 +1751,4 @@ def phys_key(hwnd, key, delay=1.5, modifiers=None):
         for m in reversed(modifiers):
             pyautogui.keyUp(m)
     time.sleep(delay)
-
-
-# ---------------------------------------------------------------------------
-# Kill orphan monkeydo Java processes
-# ---------------------------------------------------------------------------
-
-def _kill_orphan_monkeydo():
-    """Kill any leftover monkeydo wrapper + Java child that block the push socket.
-
-    On macOS the wrapper is a shell launcher; the actual push is performed by a
-    Java process whose command line contains ``MonkeyDoDeux``. A previous
-    push that timed out can leave the Java child holding the simulator's push
-    socket, which silently rejects later pushes. Kill both.
-
-    Scoped to our own uid (``pkill -u``): the pattern is a command-line
-    substring, and on a shared machine another user's process could match it.
-    Ours are the only ones we have any business killing.
-
-    Windows: the same match, done in-process -- java.exe processes in our own
-    logon session whose command line names MonkeyDoDeux. (This used to shell
-    out to ``wmic``, which current Windows 11 no longer ships, so it silently
-    did nothing.) With their children: TerminateProcess takes none along, and
-    every killed push left its shell.exe running and connected to the
-    simulator -- one more per push. Shells already orphaned that way are
-    swept too.
-    """
-    if IS_WIN:
-        try:
-            _kill_monkeydo_trees_win()
-        except Exception:
-            pass   # best effort: a stale push socket costs a retry, not a capture
-    elif IS_MAC:
-        for pattern in ("monkeydodeux", "MonkeyDoDeux"):
-            subprocess.run(["pkill", "-u", str(os.getuid()), "-f", pattern],
-                           capture_output=True)
-
-
-# What a monkeydo java process starts: the SDK's shell.exe, or simport's shim
-# (cmd.exe running shellrelay.py on python.exe). Only these names are followed
-# down the tree, so a stale parent pid that happens to match cannot take an
-# unrelated program with it.
-_MONKEYDO_CHILDREN = ("shell.exe", "cmd.exe", "python.exe")
-
-
-def _kill_monkeydo_trees_win():
-    from .. import _winapi
-    mine = _winapi.session_id()
-    procs = _winapi.processes()
-    alive = {pid for pid, _pp, _n in procs}
-    kids: dict = {}
-    for pid, ppid, name in procs:
-        kids.setdefault(ppid, []).append((pid, name.lower()))
-    doomed = []
-    for pid, ppid, name in procs:
-        name = name.lower()
-        if name in ("java.exe", "javaw.exe"):
-            if (_winapi.session_id(pid) == mine
-                    and "monkeydodeux" in (_winapi.command_line(pid) or "").lower()):
-                doomed.append(pid)
-                stack = [pid]
-                while stack:
-                    for child, cname in kids.get(stack.pop(), ()):
-                        if cname in _MONKEYDO_CHILDREN:
-                            doomed.append(child)
-                            stack.append(child)
-        elif name == "shell.exe" and ppid not in alive:
-            if (_winapi.session_id(pid) == mine
-                    and "--transport_args=127.0.0.1:" in (_winapi.command_line(pid) or "")):
-                doomed.append(pid)
-    for pid in doomed:
-        _winapi.terminate(pid)
-
-
-# ---------------------------------------------------------------------------
-# Simulator lifecycle
-# ---------------------------------------------------------------------------
-
-def ensure_simulator():
-    """Start the CIQ Simulator if not already running.  Returns hwnd.
-
-    When the simulator is already up, returns immediately. When it is not,
-    polls every 250 ms (instead of 1 s) for up to 30 s, then waits briefly
-    for the window to fully render before returning so the next monkeydo
-    push lands on a ready window.
-    """
-    hwnd = find_sim_window()
-    if hwnd:
-        return hwnd
-    if not _sdk:
-        raise SimulatorLaunchError(
-            "Connect IQ SDK not found: screenshot_utils.init(sdk, project) has "
-            "not been called, or CIQ_HOME points nowhere. Run `ciqkit doctor`.")
-    log.debug("Starting simulator...")
-    if IS_MAC:
-        # macOS: the simulator binary is a wxWidgets/Carbon GUI app and MUST
-        # be launched via LaunchServices (`open -a`) so it is registered as a
-        # foreground app. Launching the binary directly via subprocess.Popen
-        # makes macOS classify it as a background process and the app calls
-        # abort() during startup (SIGABRT, procRole=Background in the crash
-        # report). It also requires a real local console session — running
-        # over Jump Desktop / VNC / Screen Sharing typically still fails with
-        # the same abort, because wxWidgets cannot attach to the WindowServer.
-        app_bundle = os.path.join(_sdk, "bin", "ConnectIQ.app")
-        if not os.path.isdir(app_bundle):
-            raise SimulatorLaunchError(
-                f"simulator app bundle not found: {app_bundle}")
-        subprocess.Popen(["open", "-a", app_bundle],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        sim_candidates = []
-        if IS_WIN:
-            sim_candidates.append(os.path.join(_sdk, "bin", "simulator.exe"))
-        else:
-            sim_candidates.append(os.path.join(_sdk, "bin", "simulator"))
-        sim_exe = next((p for p in sim_candidates if os.path.exists(p)), None)
-        if not sim_exe:
-            raise SimulatorLaunchError(
-                f"simulator not found in any expected path: {sim_candidates}")
-        # Detached (and on Windows console-less and out of the caller's job
-        # object): the simulator must outlive the broker that started it, or
-        # every idle-exit would take the user's simulator down with it.
-        from .._compat import detached_popen
-        detached_popen([sim_exe], gui=True, cwd=_project or ".",
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       stdin=subprocess.DEVNULL)
-    deadline = time.time() + 30.0
-    while time.time() < deadline:
-        time.sleep(0.25)
-        hwnd = find_sim_window()
-        if hwnd:
-            # Confirm the window is fully realized: poll until a capture
-            # succeeds OR a short bounded settle elapses. Faster than the
-            # blanket 2 s sleep on machines where the window paints quickly --
-            # but only with the preamble off. find_sim_window() just returned
-            # this handle, so re-probing it is redundant, and a default capture
-            # costs ~2.1 s, which fits into a 2.5 s budget at most once: the
-            # loop was slower than the sleep it replaced. At ~0.15 s a look it
-            # polls ~15 times and returns as soon as the window paints.
-            settle_deadline = time.time() + 2.5
-            while time.time() < settle_deadline:
-                try:
-                    img, _ = capture_window(hwnd, refocus=False,
-                                            grab_settle_s=0)
-                    if img is not None and img.size[0] > 50:
-                        return hwnd
-                except Exception:
-                    pass
-                time.sleep(0.2)
-            return hwnd
-    if IS_MAC:
-        raise SimulatorLaunchError(
-            "simulator did not start within 30 seconds.\n"
-            "  On macOS it needs a real local graphical session; a remote one "
-            "(VNC, Screen Sharing, SSH) can abort it.\n"
-            "  Check ~/Library/Logs/DiagnosticReports/simulator-*.ips")
-    if IS_WIN:
-        raise SimulatorLaunchError(
-            "simulator did not start within 30 seconds.\n"
-            "  It needs an interactive desktop: not a service, a scheduled "
-            "task without 'run only when user is logged on', or a locked "
-            "session.\n"
-            "  Try starting bin\\simulator.exe from the SDK by hand to see "
-            "its own error.")
-    raise SimulatorLaunchError("simulator did not start within 30 seconds")
-
-
-def _restart_simulator():
-    """Kill and restart the CIQ simulator.  Returns new hwnd.
-
-    This is a hard kill of the running simulator, so anything the loaded app
-    held in memory is gone. ciqkit escalates to it only when a push has failed
-    to produce a loaded app; if you had the simulator open for your own
-    debugging, that session goes with it.
-
-    ``pkill -x`` matches the process name exactly (``simulator``, not Apple's
-    ``Simulator``) and ``-u`` limits it to our own uid, so it cannot reach a
-    process belonging to anyone else on the machine. On Windows the same
-    scoping is our own logon session -- ``taskkill /im simulator.exe``, what
-    this used to run, kills every user's simulator when run elevated.
-    """
-    hwnd = find_sim_window()
-    if hwnd:
-        log.info("restarting the Connect IQ simulator")
-        if IS_WIN:
-            from .. import _winapi
-            for pid in _winapi.pids_named("simulator.exe"):
-                _winapi.terminate(pid)
-        elif IS_MAC:
-            subprocess.run(["pkill", "-x", "-u", str(os.getuid()), "simulator"],
-                           capture_output=True)
-        time.sleep(2)
-    return ensure_simulator()
-
-
-
 

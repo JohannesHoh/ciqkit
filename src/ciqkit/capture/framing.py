@@ -116,7 +116,7 @@ def _sim_device_layout(sim_json, _mtime_ns):
 
 
 def _sim_json_path(device_id):
-    from ..sim.preflight import devices_root
+    from ..sdk import devices_root
     root = devices_root()
     if not root or not device_id:
         return None
@@ -295,7 +295,7 @@ def sim_display_box(img, device_id):
     pixels, so a scaled (Retina) or differently drawn capture falls back to
     the detectors instead of getting a confidently wrong box.
     """
-    from ..sim.preflight import devices_root
+    from ..sdk import devices_root
     root = devices_root()
     if not root or not device_id:
         return None
@@ -323,7 +323,7 @@ def sim_display_box(img, device_id):
 
 def _sdk_device_png_path(device_id):
     """Return the Garmin SDK device PNG path for `device_id`, or None."""
-    from ..sim.preflight import devices_root   # stdlib-only, no cycle
+    from ..sdk import devices_root
     home = devices_root()
     if not home:
         return None

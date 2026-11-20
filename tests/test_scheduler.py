@@ -6,10 +6,14 @@ Connect IQ install required -- these run in CI on a plain Linux box.
 
 Run: pytest tests/test_scheduler.py
 """
+import os
 import threading
 import time
 
+import pytest
+
 from ciqkit.sim import broker as broker_mod
+from ciqkit.sim import protocol as proto
 from ciqkit.sim.broker import Broker
 from ciqkit.sim.protocol import Job, Chunk, ChunkKind, Priority, JobState, Op
 from ciqkit.sim.session import app_identity
@@ -366,8 +370,8 @@ def test_a_seed_that_lands_after_its_chunk_timed_out_is_still_restored():
     the patch's owner, its _finish had already been and gone, so nothing would
     ever restore it -- and every later seeded job would fail with "a seed is
     already active". Ownership is recorded on the scheduler thread precisely so
-    a late patch stays unowned, and unowned means anyone's completion restores
-    it."""
+    a late patch stays unowned, and an unowned patch has its restore scheduled
+    by the chunk that applied it."""
     b, fake, _ = _run_broker()
     fake.seed_s = 0.5
     job = Job(app="appS", label="S", priority=Priority.NORMAL, chunks=[
@@ -999,3 +1003,581 @@ def test_one_lease_timeout_fails_every_queued_job_at_once():
     assert all(j.state == JobState.FAILED and "lease" in (j.error or "") for j in done)
     assert len(calls) == 1, f"the lease was waited on {len(calls)} times"
     assert not fake.log
+
+
+# --- request path: STATUS, the load-gen table, the seed gate, budgets --------
+
+class _FlippingCurrent(FakeSession):
+    """`current` changes under the reader: the scheduler thread reassigns it
+    without the broker lock (a restart sets it to None)."""
+    _reads = 0
+
+    @property
+    def current(self):
+        self._reads += 1
+        return ("app", "venu3") if self._reads % 2 else None
+
+    @current.setter
+    def current(self, v):
+        pass
+
+
+def test_status_survives_the_loaded_app_vanishing_between_two_reads():
+    b = Broker(session=_FlippingCurrent())
+    r = b.handle({"op": Op.STATUS})
+    assert r["ok"] is True, r
+    assert r["loaded"] == ["app", "venu3"]
+
+
+def test_a_cancelled_paused_jobs_load_generation_is_reaped_with_it(monkeypatch):
+    """CANCEL of a job that is not running never passes through _finish, so
+    only the table reaper can drop its _job_load_gen entry."""
+    monkeypatch.setattr(broker_mod, "JOB_RETENTION_S", 0.2)
+    b, fake, _ = _run_broker()
+    fake.act_s_by_label["urgent"] = 0.4
+    batch = _mk("appA", "batch", Priority.BATCH, 4)
+    b.handle({"op": Op.SUBMIT, "job": batch.to_dict()})
+    _wait_for(lambda: batch.id in b._job_load_gen, what="the batch job loaded")
+    urgent = _mk("appB", "urgent", Priority.URGENT, 1)
+    b.handle({"op": Op.SUBMIT, "job": urgent.to_dict()})
+    _wait_for(lambda: b.jobs[batch.id].state == JobState.PAUSED,
+              what="the batch job was preempted")
+    b.handle({"op": Op.CANCEL, "job_id": batch.id})
+    _wait_done(b, urgent.id)
+    time.sleep(0.35)
+    waker = _mk("appC", "waker", Priority.NORMAL, 0)   # runs the reaper again
+    b.handle({"op": Op.SUBMIT, "job": waker.to_dict()})
+    _wait_done(b, waker.id)
+    b.handle({"op": Op.SHUTDOWN})
+    assert batch.id not in b.jobs
+    assert b._job_load_gen == {}, b._job_load_gen
+
+
+def _seeded_then_cancelled(fake, app_dir):
+    """A broker whose seed owner has been cancelled, its restore not yet run,
+    and a second job queued to build the same tree. No scheduler thread: the
+    test plays the scheduler's steps itself, so the window between CANCEL and
+    the restore -- narrow in the live loop -- is held open."""
+    b = Broker(session=fake)
+    owner = Job(app="appP", label="owner", priority=Priority.BATCH, chunks=[
+        Chunk(ChunkKind.SEED, {"app_dir": app_dir, "consts": {"SEED_A": "true"}},
+              expected_s=0.1, max_s=5),
+        Chunk(ChunkKind.ACT, {}, expected_s=0.1, max_s=5),
+    ])
+    b.handle({"op": Op.SUBMIT, "job": owner.to_dict()})
+    b._run_chunk(b.jobs[owner.id], b.jobs[owner.id].chunks[0])
+    assert b._seed_job_id == owner.id and fake.seeded
+    b.handle({"op": Op.CANCEL, "job_id": owner.id})
+    plain = Job(app="appP", label="plain", priority=Priority.URGENT, chunks=[
+        Chunk(ChunkKind.LOAD, {"app_dir": app_dir, "device": "venu3"},
+              expected_s=0.1, max_s=5),
+    ])
+    b.handle({"op": Op.SUBMIT, "job": plain.to_dict()})
+    return b, plain
+
+
+def test_a_cancelled_seed_owner_gates_builds_until_its_restore_ran(tmp_path):
+    fake = FakeSession()
+    b, plain = _seeded_then_cancelled(fake, str(tmp_path))
+    with b.cond:
+        assert b._runnable() is None, \
+            "a build of the seeded tree was runnable before the restore"
+    b._restore_if_pending()
+    assert fake.restores == 1 and not fake.seeded
+    with b.cond:
+        assert b._runnable() is b.jobs[plain.id]
+
+
+def test_a_restore_that_raises_keeps_the_gate_and_is_retried(tmp_path):
+    class FlakyRestore(FakeSession):
+        fail = True
+
+        def restore(self):
+            if self.fail:
+                raise OSError("disk full")
+            return super().restore()
+
+    fake = FlakyRestore()
+    b, plain = _seeded_then_cancelled(fake, str(tmp_path))
+    b._restore_if_pending()
+    with b.cond:
+        assert b._runnable() is None, "a failed restore dropped the seed gate"
+        assert b._seed_job_id is not None and b._restore_pending
+    fake.fail = False
+    b._restore_if_pending()          # next round, inside the backoff: no retry
+    assert fake.restores == 0, "a retry ran back to back with the failure"
+    with b.cond:
+        assert b._runnable() is None
+    b._restore_next_at = 0.0         # the backoff has run out
+    b._restore_if_pending()
+    assert fake.restores == 1
+    with b.cond:
+        assert b._seed_job_id is None
+        assert b._runnable() is b.jobs[plain.id]
+
+
+def test_a_restore_that_keeps_failing_fails_the_jobs_it_gates(tmp_path):
+    class BrokenRestore(FakeSession):
+        def restore(self):
+            raise OSError("No such file or directory")
+
+    b, plain = _seeded_then_cancelled(BrokenRestore(), str(tmp_path))
+    for _ in range(5):               # many attempts, all inside the window
+        b._restore_next_at = 0.0
+        b._restore_if_pending()
+        with b.cond:
+            b._fail_seed_gated_locked()
+        assert b.jobs[plain.id].state not in (JobState.FAILED, JobState.DONE), \
+            "gated job failed before restores had been failing for the window"
+    # The limit is time, not attempts: once the first failure is older than
+    # RESTORE_GIVE_UP_S, the next round gives up on the gated jobs.
+    b._restore_failing_since -= broker_mod.RESTORE_GIVE_UP_S
+    with b.cond:
+        b._fail_seed_gated_locked()
+        assert b._seed_job_id is not None, "the gate must stay up: the patch is in the tree"
+    j = b.jobs[plain.id]
+    assert j.state == JobState.FAILED
+    assert "could not be restored" in j.error and "No such file" in j.error
+
+
+class _FailingRestore(FakeSession):
+    """restore() raises while ``fail`` is set, as a locked or vanished file does."""
+    fail = True
+
+    def restore(self):
+        with self.lock:
+            self.restores += 1
+        if self.fail:
+            raise OSError("file is locked")
+        self.seeded = False
+        return {"ok": True}
+
+
+
+@pytest.mark.parametrize("how", ["timed-out", "cancelled"])
+def test_an_unowned_seed_whose_restore_fails_still_gates_its_tree(tmp_path, how):
+    """A SEED that times out or is cancelled in flight is never recorded as the
+    owner, yet may have patched the tree. With no owner the gate used to drop at
+    once -- and when the restore failed, the next job built the seeded source."""
+    seeded_dir, other_dir = str(tmp_path / "seeded"), str(tmp_path / "other")
+    for d in (seeded_dir, other_dir):
+        (tmp_path / os.path.basename(d)).mkdir()
+
+    class S(_FailingRestore):
+        def seed(self, *a, **k):
+            if how == "cancelled":
+                b.handle({"op": Op.CANCEL, "job_id": owner.id})
+            return super().seed(*a, **k)
+
+    fake = S()
+    fake.seed_s = 0.3 if how == "timed-out" else 0.0
+    b = Broker(session=fake)
+    owner = Job(app="appO", label="owner", priority=Priority.BATCH, chunks=[
+        Chunk(ChunkKind.SEED, {"app_dir": seeded_dir, "consts": {"SEED_A": "true"}},
+              expected_s=0.01, max_s=0.05 if how == "timed-out" else 5),
+    ])
+    b.handle({"op": Op.SUBMIT, "job": owner.to_dict()})
+    o = b.jobs[owner.id]
+    b._run_chunk(o, o.chunks[0])
+    if how == "timed-out":
+        b._zombie.join(5)        # what _reap_zombie waits for
+        b._zombie = None
+    assert fake.restores == 0, "a restore ran inline, under the broker lock"
+    b._restore_if_pending()      # the next loop round
+    assert fake.seeded and fake.restores == 1
+    assert b._seed_job_id is None and b._restore_pending, \
+        "precondition: an unowned patch whose restore failed"
+
+    def load(label, **args):
+        j = Job(app="app" + label, label=label, priority=Priority.URGENT, chunks=[
+            Chunk(ChunkKind.LOAD, {"device": "venu3", **args},
+                  expected_s=0.1, max_s=5)])
+        b.handle({"op": Op.SUBMIT, "job": j.to_dict()})
+        return b.jobs[j.id]
+    same = load("same", app_dir=seeded_dir)
+    other = load("other", app_dir=other_dir)
+    prg = load("prg", prg="x.prg")
+    with b.cond:
+        assert b._blocked_by_seed(same), "a build of the seeded tree was let through"
+        assert not b._blocked_by_seed(other) and not b._blocked_by_seed(prg), \
+            "the gate must hold back only the seeded tree"
+
+    fake.fail = False
+    b._restore_next_at = 0.0
+    b._restore_if_pending()
+    with b.cond:
+        assert not fake.seeded and not b._restore_pending
+        assert not b._blocked_by_seed(same)
+
+
+def test_restore_retries_back_off_and_do_not_block_other_work(monkeypatch, tmp_path):
+    """The first retry ran on the very next loop round, so a three-attempt limit
+    was spent within seconds. Retries now back off -- without sleeping on the
+    scheduler thread: a job the stuck seed does not gate still runs meanwhile."""
+    monkeypatch.setattr(broker_mod, "RESTORE_RETRY_MIN_S", 0.2)
+    monkeypatch.setattr(broker_mod, "RESTORE_RETRY_MAX_S", 0.4)
+    fake = _FailingRestore()
+    b = Broker(session=fake)
+    th = threading.Thread(target=b.scheduler, daemon=True)
+    th.start()
+    try:
+        seeder = Job(app="appS", label="seeder", priority=Priority.NORMAL, chunks=[
+            Chunk(ChunkKind.SEED, {"app_dir": str(tmp_path), "consts": {"SEED_A": "1"}},
+                  expected_s=0.01, max_s=5),
+            Chunk(ChunkKind.LOAD, {"prg": "x.prg", "device": "venu3"},
+                  expected_s=0.1, max_s=5),
+        ])
+        b.handle({"op": Op.SUBMIT, "job": seeder.to_dict()})
+        assert _wait_done(b, seeder.id, timeout=5).state == JobState.DONE
+        _wait_for(lambda: fake.restores >= 1, what="the first restore")
+        t0 = time.time()
+        free = _mk("appF", "free", Priority.NORMAL, 2)   # a prg: not gated
+        b.handle({"op": Op.SUBMIT, "job": free.to_dict()})
+        assert _wait_done(b, free.id, timeout=5).state == JobState.DONE, \
+            "a job the seed does not gate waited on the restore backoff"
+        time.sleep(max(0.0, 1.2 - (time.time() - t0)))
+        n = fake.restores
+        # At 0, +0.2, +0.6, +1.0 (capped at 0.4): about four. Back to back it
+        # was one per loop round -- hundreds -- and idle, none at all.
+        assert 2 <= n <= 8, f"{n} restore attempts in ~1.2 s"
+        assert b._restore_pending and b._restore_failures == n
+    finally:
+        fake.fail = False
+        b.handle({"op": Op.SHUTDOWN})
+        th.join(5)
+
+
+def _unowned_failing_seed(tmp_path, n_gated):
+    """An unowned patch (its SEED cancelled in flight) whose first restore
+    failed, plus ``n_gated`` jobs queued to build the seeded tree. No
+    scheduler thread: the test plays its steps."""
+    class S(_FailingRestore):
+        def seed(self, *a, **k):
+            b.handle({"op": Op.CANCEL, "job_id": owner.id})
+            return super().seed(*a, **k)
+
+    fake = S()
+    b = Broker(session=fake)
+    owner = Job(app="appO", label="owner", priority=Priority.BATCH, chunks=[
+        Chunk(ChunkKind.SEED, {"app_dir": str(tmp_path), "consts": {"SEED_A": "true"}},
+              expected_s=0.01, max_s=5)])
+    b.handle({"op": Op.SUBMIT, "job": owner.to_dict()})
+    b._run_chunk(b.jobs[owner.id], b.jobs[owner.id].chunks[0])
+    b._restore_if_pending()
+    assert b._seed_job_id is None and b._restore_pending and fake.restores == 1
+    gated = []
+    for i in range(n_gated):
+        j = Job(app=f"app{i}", label=f"g{i}", priority=Priority.URGENT, chunks=[
+            Chunk(ChunkKind.LOAD, {"app_dir": str(tmp_path), "device": "venu3"},
+                  expected_s=0.1, max_s=5)])
+        b.handle({"op": Op.SUBMIT, "job": j.to_dict()})
+        gated.append(b.jobs[j.id])
+    return b, fake, gated
+
+
+def test_failing_gated_jobs_at_the_give_up_point_runs_no_restore(tmp_path):
+    """With no owner, every gated job failed at the give-up point used to run a
+    restore of its own, inline, under the lock: back to back past the backoff,
+    each up to ZOMBIE_GRACE_S while STATUS/CANCEL/WAIT queued on the lock."""
+    b, fake, gated = _unowned_failing_seed(tmp_path, 3)
+    b._restore_failing_since -= broker_mod.RESTORE_GIVE_UP_S
+    with b.cond:
+        b._fail_seed_gated_locked()
+    assert fake.restores == 1, "failing a gated job ran a restore"
+    assert all(j.state == JobState.FAILED for j in gated)
+    assert b._restore_pending, "the scheduled retry must still be due"
+
+
+def test_a_successful_restore_lifts_the_gate_and_fails_nobody(tmp_path):
+    """Clearing the seed but not _restore_pending left a gate on EVERY build
+    (no tree named), and an expired failure clock then failed those jobs with
+    "could not be restored after 0 attempts" right after the tree was fixed."""
+    b, fake, gated = _unowned_failing_seed(tmp_path, 3)
+    b._restore_failing_since -= broker_mod.RESTORE_GIVE_UP_S
+    fake.fail = False
+    b._restore_now()                 # not via _restore_if_pending: no pre-clear
+    assert fake.restores == 2 and not fake.seeded
+    with b.cond:
+        assert not b._restore_pending and b._restore_failing_since is None
+        b._fail_seed_gated_locked()
+        assert not any(b._blocked_by_seed(j) for j in gated), "the gate stayed up"
+        assert b._runnable() in gated
+    assert not any(j.state in (JobState.FAILED, JobState.DONE) for j in gated)
+
+
+def test_a_slow_restore_does_not_hold_the_lock_status_needs(tmp_path):
+    """The client gives STATUS/CANCEL/SUBMIT 10 s; a restore may take up to
+    ZOMBIE_GRACE_S. Run under the lock, a slow one timed out every other op."""
+    b, fake, th = _run_broker()
+    entered, release = threading.Event(), threading.Event()
+    real_restore = fake.restore
+
+    def slow_restore():
+        if fake.seeded:
+            entered.set()
+            release.wait(5)
+        return real_restore()
+    fake.restore = slow_restore
+    try:
+        job = Job(app="appS", label="seeder", priority=Priority.NORMAL, chunks=[
+            Chunk(ChunkKind.SEED, {"app_dir": str(tmp_path), "consts": {"SEED_A": "1"}},
+                  expected_s=0.01, max_s=5),
+            Chunk(ChunkKind.LOAD, {"prg": "x.prg", "device": "venu3"},
+                  expected_s=0.1, max_s=5),
+        ])
+        b.handle({"op": Op.SUBMIT, "job": job.to_dict()})
+        assert entered.wait(5), "the owner's restore never started"
+        t0 = time.monotonic()
+        st = b.handle({"op": Op.STATUS})
+        cancel = b.handle({"op": Op.CANCEL, "job_id": job.id})
+        assert time.monotonic() - t0 < 0.5, "STATUS/CANCEL waited on the restore"
+        assert st["ok"] and cancel["ok"]
+        with b.cond:
+            assert b._restore_pending, "the gate dropped while the restore ran"
+        release.set()
+        _wait_for(lambda: not fake.seeded and not b._restore_pending,
+                  what="the restore finished")
+    finally:
+        release.set()
+        b.handle({"op": Op.SHUTDOWN})
+        th.join(5)
+
+
+def test_a_restore_that_cannot_be_stopped_stops_the_broker(monkeypatch, tmp_path):
+    """restore() ran on the scheduler thread itself, unbounded: one stuck on a
+    hung file system wedged the scheduler, and the broker accepted jobs it
+    never ran. Now it is bounded, and an overrun stops the broker -- without a
+    second restore started beside the stuck one at teardown."""
+    monkeypatch.setattr(broker_mod, "ZOMBIE_GRACE_S", 0.3)
+    b, fake, th = _run_broker()
+    release = threading.Event()
+
+    def stuck_restore():
+        with fake.lock:
+            fake.restores += 1
+        release.wait(5)
+        return {"ok": True}
+    fake.restore = stuck_restore
+    try:
+        job = Job(app="appS", label="seeder", priority=Priority.NORMAL, chunks=[
+            Chunk(ChunkKind.SEED, {"app_dir": str(tmp_path), "consts": {"SEED_A": "1"}},
+                  expected_s=0.01, max_s=5),
+            Chunk(ChunkKind.LOAD, {"prg": "x.prg", "device": "venu3"},
+                  expected_s=0.1, max_s=5),
+        ])
+        queued = _mk("appQ", "queued", Priority.BATCH, 1)
+        b.handle({"op": Op.SUBMIT, "job": job.to_dict()})
+        b.handle({"op": Op.SUBMIT, "job": queued.to_dict()})
+        th.join(5)
+        assert not th.is_alive() and b._stop, "the broker kept going"
+        q = b.jobs[queued.id]
+        assert q.state == JobState.FAILED and "restor" in (q.error or ""), q.error
+        assert fake.restores == 1, "teardown started a second restore beside the stuck one"
+    finally:
+        release.set()
+
+
+def test_a_restart_that_cannot_be_stopped_stops_the_broker(monkeypatch):
+    """The zombie reaper's restart() ran unbounded on the scheduler thread."""
+    monkeypatch.setattr(broker_mod, "ZOMBIE_GRACE_S", 0.3)
+    b, fake, th = _run_broker()
+    release = threading.Event()
+
+    def stuck_restart():
+        release.wait(5)
+        return {"ok": True}
+    fake.restart = stuck_restart
+    fake.act_s_by_label["slow"] = 1.0
+    try:
+        slow = Job(app="appS", label="slow", priority=Priority.NORMAL, chunks=[
+            Chunk(ChunkKind.LOAD, {"prg": "x.prg", "device": "venu3"},
+                  expected_s=0.1, max_s=5),
+            Chunk(ChunkKind.ACT, {}, expected_s=0.05, max_s=0.05),
+        ])
+        b.handle({"op": Op.SUBMIT, "job": slow.to_dict()})
+        _wait_for(lambda: ("slow", "ACT") in fake.log, what="the slow act started")
+        nxt = _mk("appN", "next", Priority.BATCH, 1)
+        b.handle({"op": Op.SUBMIT, "job": nxt.to_dict()})
+        th.join(5)
+        assert not th.is_alive() and b._stop, "the broker kept going"
+        n = b.jobs[nxt.id]
+        assert n.state == JobState.FAILED and "restart" in (n.error or ""), n.error
+        assert not any(lbl == "next" for (lbl, _k) in fake.log), fake.log
+    finally:
+        release.set()
+
+
+class _BudgetSession(FakeSession):
+    build_s = 0.3
+
+    def __init__(self):
+        super().__init__()
+        self.timeouts = []
+
+    def build(self, *a, **k):
+        self.timeouts.append(("build", k["timeout_s"]))
+        time.sleep(self.build_s)
+        return "fake.prg"
+
+    def run_tests(self, prg, device="venu3", timeout_s=300):
+        self.timeouts.append(("run_tests", timeout_s))
+        return {"ok": True, "passed": 1, "failed": 0}
+
+
+def test_a_build_gets_less_than_the_chunk_so_its_own_timeout_fires_first(tmp_path):
+    """Handed the full max_s, the build always lost the race to the worker
+    join: a slow monkeyc became a zombie worker and a simulator restart."""
+    fake = _BudgetSession()
+    b = Broker(session=fake)
+    load = Chunk(ChunkKind.LOAD, {"app_dir": str(tmp_path), "device": "venu3"},
+                 expected_s=1, max_s=30)
+    b._dispatch(Job(app="a", chunks=[load]), load)
+    [(kind, t)] = fake.timeouts
+    assert kind == "build" and 0 < t < load.max_s
+
+
+def test_a_test_batch_shares_one_budget_between_build_and_tests(tmp_path):
+    fake = _BudgetSession()
+    b = Broker(session=fake)
+    # Above the margin, which is wider on Windows, so the build has a budget.
+    tb = Chunk(ChunkKind.TEST_BATCH, {"app_dir": str(tmp_path), "device": "venu3"},
+               expected_s=1, max_s=broker_mod.BUDGET_MARGIN_S + 25)
+    b._dispatch(Job(app="a", chunks=[tb]), tb)
+    (k1, build_t), (k2, tests_t) = fake.timeouts
+    assert (k1, k2) == ("build", "run_tests")
+    assert build_t < tb.max_s
+    # The tests get what the build LEFT, not max_s afresh: the time the build
+    # really took plus the tests' budget stays inside the chunk, with the margin
+    # to spare for the worker join.
+    assert fake.build_s + tests_t <= tb.max_s - broker_mod.BUDGET_MARGIN_S + 1e-6
+    assert tests_t < tb.max_s - fake.build_s
+
+
+class _KwargSession(FakeSession):
+    """Records the kwargs each session call actually receives."""
+
+    def __init__(self):
+        super().__init__()
+        self.kw = {}
+
+    def seed(self, app_dir, consts=None, patches=None, **kw):
+        self.kw["seed"] = kw
+        return {"ok": True}
+
+    def load(self, app, prg, device="venu3", **kw):
+        self.kw["load"] = kw
+        return {"ok": True}
+
+    def act(self, **kw):
+        self.kw["act"] = kw
+        return {"ok": True}
+
+
+def test_dispatch_forwards_only_given_session_kwargs():
+    """A default lives in the SimSession signature: a chunk that does not carry
+    storage/kind/force forwards none of them; one that does forwards them."""
+    s = _KwargSession()
+    b = Broker(session=s)
+
+    def run(ck, **args):
+        c = Chunk(kind=ck, args=args)
+        b._dispatch(Job(app="a", chunks=[c]), c)
+
+    run(ChunkKind.SEED, app_dir="d")
+    run(ChunkKind.LOAD, prg="p")
+    run(ChunkKind.ACT)
+    assert s.kw["seed"] == {}
+    assert "storage_start" not in s.kw["load"] and "force" not in s.kw["load"]
+    assert s.kw["act"] == {}   # "tap" is act()'s own default
+
+    run(ChunkKind.SEED, app_dir="d", force=True)
+    run(ChunkKind.LOAD, prg="p", storage="keep", force=True)
+    run(ChunkKind.ACT, kind="key")
+    assert s.kw["seed"] == {"force": True}
+    assert s.kw["load"]["storage_start"] == "keep" and s.kw["load"]["force"] is True
+    assert s.kw["act"]["kind"] == "key"
+
+
+def test_wait_on_a_seed_owner_answers_only_once_its_patch_is_out(tmp_path):
+    """The owner's restore runs at the top of the next loop round, not in
+    _finish. A WAIT answered at DONE meant ok=True while the user's source was
+    still patched; it must answer once the restore has run."""
+    b, fake, th = _run_broker()
+    entered, release = threading.Event(), threading.Event()
+    real_restore = fake.restore
+
+    def slow_restore():
+        if fake.seeded:
+            entered.set()
+            release.wait(5)
+        return real_restore()
+    fake.restore = slow_restore
+    try:
+        # SEED + LOAD and no RESTORE chunk: the restore is the broker's own.
+        job = Job(app="appS", label="seeder", priority=Priority.NORMAL, chunks=[
+            Chunk(ChunkKind.SEED, {"app_dir": str(tmp_path), "consts": {"SEED_A": "1"}},
+                  expected_s=0.01, max_s=5),
+            Chunk(ChunkKind.LOAD, {"prg": "x.prg", "device": "venu3"},
+                  expected_s=0.1, max_s=5),
+        ])
+        b.handle({"op": Op.SUBMIT, "job": job.to_dict()})
+        assert entered.wait(5), "the owner's restore never started"
+        early = b.handle({"op": Op.WAIT, "job_id": job.id, "timeout_s": 0.3})
+        assert early.get("code") == proto.E_WAIT_TIMEOUT, \
+            "WAIT answered while the seed patch was still in the source"
+        release.set()
+        done = b.handle({"op": Op.WAIT, "job_id": job.id, "timeout_s": 5})
+        assert done["ok"] and not fake.seeded
+    finally:
+        release.set()
+        b.handle({"op": Op.SHUTDOWN})
+        th.join(5)
+
+
+def _seed_load_job(tmp_path):
+    return Job(app="appS", label="seeder", priority=Priority.NORMAL, chunks=[
+        Chunk(ChunkKind.SEED, {"app_dir": str(tmp_path), "consts": {"SEED_A": "1"}},
+              expected_s=0.01, max_s=5),
+        Chunk(ChunkKind.LOAD, {"prg": "x.prg", "device": "venu3"},
+              expected_s=0.1, max_s=5)])
+
+
+def test_shutdown_with_an_unrestorable_seed_answers_wait_not_ok(tmp_path):
+    """_teardown cleared the seed even when its restore failed, so a WAIT on
+    the owner read ok=True with the source still patched."""
+    b, fake, th = _run_broker()
+
+    def bad():
+        raise OSError("read-only")
+    fake.restore = bad
+    job = _seed_load_job(tmp_path)
+    b.handle({"op": Op.SUBMIT, "job": job.to_dict()})
+    out = {}
+    w = threading.Thread(target=lambda: out.update(b.handle(
+        {"op": Op.WAIT, "job_id": job.id, "timeout_s": 20})))
+    w.start()
+    _wait_for(lambda: b._restore_failures >= 1, what="a failed restore")
+    b.handle({"op": Op.SHUTDOWN})
+    th.join(5)
+    w.join(10)
+    assert fake.seeded and out["ok"] is False
+    assert "still in the source" in out["error"]
+
+
+def test_a_wedged_restore_answers_wait_not_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(broker_mod, "ZOMBIE_GRACE_S", 0.5)
+    b, fake, th = _run_broker()
+    release = threading.Event()
+    fake.restore = lambda: release.wait(30)
+    job = _seed_load_job(tmp_path)
+    b.handle({"op": Op.SUBMIT, "job": job.to_dict()})
+    out = {}
+    w = threading.Thread(target=lambda: out.update(b.handle(
+        {"op": Op.WAIT, "job_id": job.id, "timeout_s": 20})))
+    w.start()
+    try:
+        th.join(10)
+        w.join(10)
+        assert fake.seeded and out["ok"] is False
+    finally:
+        release.set()

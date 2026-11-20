@@ -98,7 +98,7 @@ def sdk_devices_dir() -> str:
     """The SDK Manager's device folder, from the same place the rest of ciqkit
     reads it. A copy of the macOS path used to live here, so on Windows doctor
     and ``ciqkit new`` looked under ``~/Library`` and never saw a device."""
-    from .sim.preflight import devices_root   # stdlib-only, no cycle
+    from .sdk import devices_root
     return devices_root()
 
 
@@ -144,7 +144,7 @@ def monkeyc_argv(app_dir: str, device: str, *, tests: bool = False,
     build can never be mistaken for the normal one.
     """
     if sdk is None:
-        from .sim.preflight import detect_sdk
+        from .sdk import detect_sdk
         sdk = detect_sdk()
     # The SDK ships bin/monkeyc.bat on Windows, a shell script elsewhere.
     monkeyc = (os.path.join(sdk, "bin", "monkeyc.bat" if sys.platform == "win32"

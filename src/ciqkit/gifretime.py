@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from ciqkit.sim.recording import _compress_durations
+from ciqkit.sim.recording import compress_durations
 
 
 def retime(path: str, playback_ms: int = 120) -> dict:
@@ -35,7 +35,7 @@ def retime(path: str, playback_ms: int = 120) -> dict:
         # the median of the real ones instead.
         rest = sorted(wall[:-1])
         wall[-1] = rest[len(rest) // 2]
-    durations, speedup = _compress_durations(wall, playback_ms)
+    durations, speedup = compress_durations(wall, playback_ms)
     if durations == original:
         return {"path": path, "frames": len(frames), "skipped": "already fast enough"}
     frames[0].save(path, save_all=True, append_images=frames[1:],

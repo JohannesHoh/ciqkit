@@ -156,16 +156,47 @@ def test_only_one_daemon_can_hold_the_singleton_lock(tmp_path):
 
 # --- the live accept loop ----------------------------------------------------
 
-def _start(sock_path):
+def _start(sock_path, deadline_s=10.0):
+    """Start serve() and return once it has ANSWERED a ping.
+
+    The endpoint file is not readiness: the unix socket exists from bind(),
+    before listen(), and the TCP endpoint file may be written before the accept
+    loop runs -- a test connecting in that window got ConnectionRefusedError.
+    """
     th = threading.Thread(target=broker_mod.serve, args=(sock_path,), daemon=True)
     th.start()
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
+    end = time.monotonic() + deadline_s
+    last = None
+    while time.monotonic() < end:
+        if not th.is_alive():
+            pytest.fail(f"serve() exited during startup (last error: {last!r})")
+        try:
+            if _rpc(sock_path, {"op": proto.Op.PING}, timeout=2.0)["ok"] is True:
+                break
+        except (OSError, ValueError, TypeError, KeyError) as e:   # not up yet / half-written file
+            last = e
         time.sleep(0.05)
     else:
-        pytest.fail("the broker never created its endpoint")
+        pytest.fail(f"the broker never answered on its endpoint: {last!r}")
+    _wait_for_free_slots()
     return th
+
+
+def _wait_for_free_slots(deadline_s=5.0):
+    """Wait until the readiness ping's handler has given its connection slot
+    back, so a test that fills the slots on purpose starts from all free."""
+    slots, n = broker_mod._CONN_SLOTS, broker_mod.MAX_CONNS
+    end = time.monotonic() + deadline_s
+    while time.monotonic() < end:
+        got = 0
+        while got < n and slots.acquire(blocking=False):
+            got += 1
+        for _ in range(got):
+            slots.release()
+        if got == n:
+            return
+        time.sleep(0.02)
+    pytest.fail("the readiness ping's connection slot was never released")
 
 
 @pytest.fixture
@@ -205,7 +236,8 @@ def test_a_malformed_request_gets_an_error_not_a_dropped_connection(running_brok
         s.sendall(b"this is not json\n")
         line = s.makefile("rb").readline()
         assert line, "the connection was dropped instead of answered"
-        assert proto.loads(line)["ok"] is False
+        r = proto.loads(line)
+        assert r["ok"] is False and r["code"] == proto.E_BAD_REQUEST, r
     finally:
         s.close()
 
@@ -213,6 +245,140 @@ def test_a_malformed_request_gets_an_error_not_a_dropped_connection(running_brok
 def test_an_unknown_op_is_reported_rather_than_ignored(running_broker):
     r = _rpc(running_broker, {"op": "wat"})
     assert r["ok"] is False and "wat" in r["error"]
+    assert r["code"] == proto.E_BAD_REQUEST
+
+
+@pytest.mark.parametrize("req", [
+    [1, 2],                                                    # not an object
+    {"op": proto.Op.WAIT},                                     # no job_id
+    {"op": proto.Op.WAIT, "job_id": 5},                        # job_id not a string
+    {"op": proto.Op.WAIT, "job_id": "j", "timeout_s": "soon"},
+    {"op": proto.Op.BUMP},
+    {"op": proto.Op.CANCEL, "job_id": None},
+    {"op": proto.Op.SUBMIT},                                   # no job
+    {"op": proto.Op.SUBMIT, "job": "not a dict"},
+])
+def test_a_malformed_request_says_what_is_wrong(running_broker, req):
+    """Not the text of the KeyError/AttributeError the missing field raised
+    deep inside the handler, which named nothing the caller could fix."""
+    s = transport.connect(running_broker, timeout=10)
+    try:
+        s.sendall(json.dumps(req).encode() + b"\n")
+        line = s.makefile("rb").readline()
+    finally:
+        s.close()
+    r = proto.loads(line)
+    assert r["ok"] is False and r["error"].startswith("bad request: "), r
+    assert r["code"] == proto.E_BAD_REQUEST
+
+
+def test_an_overlong_request_line_is_refused_and_the_broker_lives_on(running_broker):
+    """`for line in f` would buffer a newline-less stream without bound."""
+    s = transport.connect(running_broker, timeout=10)
+    blob = b"x" * (2 * broker_mod.MAX_LINE) + b"\n"
+
+    def send():
+        try:
+            s.sendall(blob)
+        except OSError:
+            pass   # the broker may hang up before taking the whole line
+    sender = threading.Thread(target=send, daemon=True)
+    sender.start()
+    try:
+        line = s.makefile("rb").readline()
+    finally:
+        sender.join(timeout=10)
+        s.close()
+    r = proto.loads(line)
+    assert r["ok"] is False and r["error"].startswith("bad request: "), r
+    assert r["code"] == proto.E_BAD_REQUEST
+    assert _rpc(running_broker, {"op": proto.Op.PING})["ok"] is True
+
+
+
+# --- error codes on the wire ---------------------------------------------------
+# Front-ends branch on `code`; `error` is human text and free to change.
+
+@pytest.mark.parametrize("req,code", [
+    ({"op": proto.Op.SUBMIT, "job": {"app": "a", "chunks": []}}, proto.E_INVALID),
+    ({"op": proto.Op.WAIT, "job_id": "nope", "timeout_s": 0}, proto.E_NO_SUCH_JOB),
+    ({"op": proto.Op.BUMP, "job_id": "nope"}, proto.E_NO_SUCH_JOB),
+    ({"op": proto.Op.CANCEL, "job_id": "nope"}, proto.E_NO_SUCH_JOB),
+    ({"op": "wat"}, proto.E_BAD_REQUEST),
+    ({"op": proto.Op.WAIT}, proto.E_BAD_REQUEST),
+])
+def test_every_error_reply_carries_a_code(running_broker, req, code):
+    r = _rpc(running_broker, req)
+    assert r["ok"] is False and r["code"] == code, r
+    assert isinstance(r["error"], str) and r["error"]
+    assert proto.error_code(r) == code
+
+
+class _NoSession:
+    current = None
+
+
+def _job():
+    from ciqkit.sim import jobs
+    return jobs.make_job(app="a", device="venu3", chunks=jobs.op_chunks([]))
+
+
+def test_the_job_level_codes():
+    """Codes that need a job in the table or a stopping broker, straight from
+    the handler (no scheduler runs, so nothing touches a simulator)."""
+    b = broker_mod.Broker(session=_NoSession())
+    job = _job()
+    assert b.handle({"op": proto.Op.SUBMIT, "job": job.to_dict()})["ok"] is True
+    dup = b.handle({"op": proto.Op.SUBMIT, "job": job.to_dict()})
+    assert dup["code"] == proto.E_INVALID and "already exists" in dup["error"]
+    bad_prio = b.handle({"op": proto.Op.BUMP, "job_id": job.id, "priority": "high"})
+    assert bad_prio["ok"] is False and bad_prio["code"] == proto.E_INVALID
+    timeout = b.handle({"op": proto.Op.WAIT, "job_id": job.id, "timeout_s": 0})
+    assert timeout["code"] == proto.E_WAIT_TIMEOUT and timeout["error"] == "wait timeout"
+    assert timeout["job"]["id"] == job.id            # the reply still carries the job
+    b._stop = True
+    late = b.handle({"op": proto.Op.SUBMIT, "job": _job().to_dict()})
+    assert late == {"ok": False, "error": proto.ERR_SHUTTING_DOWN,
+                    "code": proto.E_SHUTTING_DOWN}
+
+
+def test_a_handler_crash_is_an_internal_error(monkeypatch):
+    b = broker_mod.Broker(session=_NoSession())
+
+    def boom(req):
+        raise RuntimeError("kaboom")
+    monkeypatch.setattr(b, "handle", boom)
+    a, z = socket.socketpair()
+    try:
+        monkeypatch.setattr(broker_mod, "_CONN_SLOTS", threading.BoundedSemaphore(1))
+        broker_mod._CONN_SLOTS.acquire()
+        th = threading.Thread(target=broker_mod._handle_conn, args=(b, z), daemon=True)
+        th.start()
+        a.sendall(proto.dumps({"op": proto.Op.PING}))
+        r = proto.loads(a.makefile("rb").readline())
+        assert r == {"ok": False, "error": "kaboom", "code": proto.E_INTERNAL}
+    finally:
+        a.close()
+        th.join(timeout=5)
+
+
+@pytest.mark.parametrize("reply,code", [
+    ({"ok": False, "error": "no such job"}, proto.E_NO_SUCH_JOB),
+    ({"ok": False, "error": "wait timeout", "job": {}}, proto.E_WAIT_TIMEOUT),
+    ({"ok": False, "error": proto.ERR_SHUTTING_DOWN}, proto.E_SHUTTING_DOWN),
+    ({"ok": False, "error": "bad request: x"}, proto.E_BAD_REQUEST),
+    ({"ok": False, "error": "unknown op wat"}, proto.E_BAD_REQUEST),
+    ({"ok": False, "error": "invalid job: x"}, proto.E_INVALID),
+    ({"ok": False, "error": "unauthorized"}, proto.E_UNAUTHORIZED),
+    ({"ok": False, "error": "broker is out of connection slots; retry shortly"},
+     proto.E_BUSY),
+    ({"ok": False, "error": "a job with id x already exists"}, proto.E_INTERNAL),
+    ({"ok": False, "job": {"state": "failed"}}, None),     # a failed job, not an error
+    ({"ok": True}, None),
+])
+def test_a_reply_without_a_code_is_read_from_its_text(reply, code):
+    """A broker from before codes still has to be understood."""
+    assert proto.error_code(reply) == code
 
 
 def test_a_second_daemon_on_the_same_socket_exits(running_broker, capsys):
@@ -247,7 +413,8 @@ def test_an_unauthenticated_tcp_peer_runs_nothing(short_runtime_dir, monkeypatch
         try:
             s.sendall(first_line + proto.dumps({"op": proto.Op.SHUTDOWN}))
             reply = s.makefile("rb").readline()
-            assert proto.loads(reply) == {"ok": False, "error": "unauthorized"}
+            assert proto.loads(reply) == {"ok": False, "error": "unauthorized",
+                                          "code": proto.E_UNAUTHORIZED}
         finally:
             s.close()
         # Still alive and still serving the real client.
@@ -294,6 +461,7 @@ def test_connections_beyond_the_cap_are_turned_away_not_queued_forever(
             held.append(c)
         r = _rpc(sock_path, {"op": proto.Op.PING})
         assert r["ok"] is False and "connection slots" in r["error"]
+        assert r["code"] == proto.E_BUSY
     finally:
         for c in held:
             c.close()

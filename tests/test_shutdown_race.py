@@ -24,7 +24,8 @@ def test_a_stopping_broker_refuses_new_jobs():
     b = Broker()
     assert b.handle({"op": Op.SHUTDOWN})["ok"] is True
     r = b.handle({"op": Op.SUBMIT, "job": _job().to_dict()})
-    assert r == {"ok": False, "error": proto.ERR_SHUTTING_DOWN}
+    assert r == {"ok": False, "error": proto.ERR_SHUTTING_DOWN,
+                 "code": proto.E_SHUTTING_DOWN}
     assert b.jobs == {}, "a job was accepted by a broker that is going away"
 
 

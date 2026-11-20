@@ -195,8 +195,17 @@ def test_a_build_command_that_does_not_exist_is_reported_clearly(session, projec
 
 # --- unit-test result parsing ------------------------------------------------
 
+def _run_via_subprocess_run(monkeypatch):
+    """run_tests calls _compat.run_killing_tree; route it through subprocess.run
+    so the fakes below (which patch subprocess.run) see the monkeydo call."""
+    from ciqkit import _compat
+    monkeypatch.setattr(_compat, "run_killing_tree",
+                        lambda *a, **k: subprocess.run(*a, **k))
+
+
 def _reachable(monkeypatch):
     from ciqkit.sim import simport
+    _run_via_subprocess_run(monkeypatch)
     st = simport.Status(sim_pids=[1], sim_ports=[1234], port=1234)
     monkeypatch.setattr(simport, "wait_for_port", lambda *a, **k: st)
     monkeypatch.setattr(simport, "monkeydo_command",
@@ -276,6 +285,94 @@ def test_a_test_run_that_hangs_is_reported_as_a_timeout(session, monkeypatch):
     monkeypatch.setattr(subprocess, "run", run)
     r = session.run_tests("x.prg", timeout_s=1)
     assert r["ok"] is False and r["reason"] == "timeout"
+
+
+# --- run_tests spends one budget ----------------------------------------------
+
+UNREACHABLE = "Unable to connect to simulator.\n"
+PASS = "Ran 3 tests\n\nPASSED (passed=3, failed=0, errors=0)\n"
+
+
+@pytest.fixture
+def budget(session, monkeypatch):
+    """A fake clock plus fake ensure / port wait / runner, each of which
+    advances the clock by what the test says it costs and records the
+    timeout it was handed. Nothing waits for real."""
+    import time
+
+    from ciqkit.capture import screenshot_utils as su
+    from ciqkit.sim import simport
+
+    clock = [1000.0]
+    calls = []
+    cfg = {"ensure_s": 0.0, "port_s": 0.0, "run_s": [], "outs": []}
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def ensure(self, *a, **k):
+        clock[0] += cfg["ensure_s"]
+        return {"ok": True}
+
+    st = simport.Status(sim_pids=[1], sim_ports=[1234], port=1234)
+
+    def wait_for_port(timeout=20.0, *a, **k):
+        calls.append(("port", timeout))
+        clock[0] += cfg["port_s"]
+        return st
+
+    def run(*_a, timeout=None, **_k):
+        calls.append(("run", timeout))
+        clock[0] += cfg["run_s"].pop(0)
+        return subprocess.CompletedProcess([], 1, cfg["outs"].pop(0), "")
+
+    monkeypatch.setattr(SimSession, "ensure", ensure)
+    monkeypatch.setattr(SimSession, "_storage_begin", lambda self, *a: None)
+    monkeypatch.setattr(SimSession, "_storage_crash_check", lambda self, *a: None)
+    monkeypatch.setattr(simport, "wait_for_port", wait_for_port)
+    monkeypatch.setattr(simport, "monkeydo_command",
+                        lambda sdk, prg, dev, extra=(), st=None: (["monkeydo"], None, "monkeydo"))
+    monkeypatch.setattr(su, "_kill_orphan_monkeydo", lambda: None)
+    monkeypatch.setattr(subprocess, "run", run)
+    _run_via_subprocess_run(monkeypatch)
+    return cfg, calls
+
+
+def test_a_retry_gets_only_what_is_left(session, budget):
+    cfg, calls = budget
+    cfg.update(run_s=[40.0, 5.0], outs=[UNREACHABLE, PASS])
+    r = session.run_tests("x.prg", timeout_s=100.0)
+    assert r["ok"] is True
+    runs = [t for k, t in calls if k == "run"]
+    # 100 - 40 spent - the settle; never the full 100 again.
+    assert runs == [pytest.approx(100.0),
+                    pytest.approx(100.0 - 40.0 - SimSession.TEST_RETRY_SETTLE_S)]
+
+
+def test_a_retry_below_the_floor_is_skipped(session, budget):
+    cfg, calls = budget
+    # Leaves 100 - 92 - settle = 5 s, under TEST_RETRY_MIN_S.
+    cfg.update(run_s=[92.0], outs=[UNREACHABLE])
+    r = session.run_tests("x.prg", timeout_s=100.0)
+    assert r["ok"] is False and r["reason"] == "simulator-unreachable"
+    assert [k for k, _ in calls] == ["port", "run"]
+
+
+def test_a_slow_ensure_shrinks_the_monkeydo_timeout(session, budget):
+    cfg, calls = budget
+    cfg.update(ensure_s=30.0, port_s=4.0, run_s=[1.0], outs=[PASS])
+    r = session.run_tests("x.prg", timeout_s=100.0)
+    assert r["ok"] is True
+    assert calls == [("port", pytest.approx(SimSession.TEST_PORT_WAIT_S)),
+                     ("run", pytest.approx(100.0 - 30.0 - 4.0))]
+
+
+def test_a_budget_gone_before_monkeydo_fails_as_a_timeout(session, budget):
+    cfg, calls = budget
+    cfg.update(ensure_s=120.0)
+    r = session.run_tests("x.prg", timeout_s=100.0)
+    assert r == {"ok": False, "reason": "timeout", "out": ""}
+    assert calls == []
 
 
 # --- device resolution -------------------------------------------------------

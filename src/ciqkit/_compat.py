@@ -20,7 +20,8 @@ else:
     import fcntl
 
 __all__ = ["IS_WIN", "pid_alive", "try_lock", "lock_blocking", "unlock",
-           "open_lock_file", "detached_popen", "hidden_console_kwargs"]
+           "open_lock_file", "detached_popen", "hidden_console_kwargs",
+           "kill_tree", "run_killing_tree", "tree_order"]
 
 
 def pid_alive(pid) -> bool:
@@ -172,3 +173,116 @@ def detached_popen(argv, *, gui: bool = False, **kwargs) -> subprocess.Popen:
         if getattr(exc, "winerror", None) != 5:   # ERROR_ACCESS_DENIED: no breakaway
             raise
         return subprocess.Popen(argv, creationflags=flags, **kwargs)
+
+
+def tree_order(procs, roots, born) -> list[int]:
+    """Pids of ``roots`` and their descendants, parents before children.
+
+    ``procs`` is ``(pid, parent pid)`` pairs; ``born(pid)`` is a creation time
+    or None. A Toolhelp parent link is the creator's pid *at creation* and is
+    never updated, so once the creator has exited its pid is reused and the
+    link then points at a stranger. A link is therefore followed only when the
+    child is known to have been created no earlier than the parent -- a
+    process cannot predate its creator. An unknown time (access denied, long
+    dead) breaks the link: better to leave a straggler than kill an unrelated
+    process. Pure so it runs on every platform.
+    """
+    kids: dict[int, list[int]] = {}
+    for pid, ppid in procs:
+        if pid != ppid:   # the idle process names itself as parent
+            kids.setdefault(ppid, []).append(pid)
+    order: list[int] = []
+    found: set[int] = set()
+    stack = list(roots)
+    while stack:
+        pid = stack.pop()
+        if pid in found:
+            continue
+        found.add(pid)
+        order.append(pid)
+        tp = born(pid)
+        for kid in kids.get(pid, ()):
+            tk = born(kid)
+            if tp is not None and tk is not None and tk >= tp:
+                stack.append(kid)
+    return order
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` and everything it started. Best effort, never raises.
+
+    POSIX: its process group, which :func:`run_killing_tree` made it the
+    leader of (a descendant that calls ``setsid`` itself escapes; monkeyc's
+    java and monkeydo's shell do not). Windows: the parent-link tree.
+    """
+    try:
+        if IS_WIN:
+            from . import _winapi
+            _winapi.kill_tree(proc.pid)
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass   # already gone (ProcessLookupError) or never ours
+    try:
+        proc.kill()   # the root at least, whatever the tree walk managed
+    except OSError:
+        pass
+
+
+def run_killing_tree(argv, *, timeout: float, kill_grace_s: float = 2.0,
+                     **kwargs) -> subprocess.CompletedProcess:
+    """``subprocess.run(argv, timeout=timeout, **kwargs)`` that really returns.
+
+    On a timeout ``subprocess.run`` kills only the direct child -- the bash or
+    cmd.exe wrapper -- and on Windows then ``communicate()``s with NO timeout,
+    waiting for EOF on pipes that monkeyc's java (or monkeydo's children)
+    still hold: the call returned only when the build ended on its own, long
+    after the broker had given up on the chunk. On POSIX it returns, but leaves
+    that java building in the background, beside the next job's build.
+
+    Here the child leads its own process group / session, a timeout (or any
+    exception, Ctrl-C included) kills the whole tree, and the output is then
+    collected with a bounded ``communicate``. The result and the exception are
+    the shapes ``subprocess.run`` gives: a ``CompletedProcess``, or
+    ``TimeoutExpired`` carrying whatever output arrived (decoded, when text
+    mode was asked for).
+
+    The new group also means a Ctrl-C in the caller's terminal no longer
+    reaches the child directly; the caller's KeyboardInterrupt kills the tree
+    instead, so the effect is the same.
+    """
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    if IS_WIN:
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **kwargs)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        kill_tree(proc)
+        try:
+            exc.stdout, exc.stderr = proc.communicate(timeout=kill_grace_s)
+        except subprocess.TimeoutExpired:
+            # Something outside the tree (a process that escaped the group)
+            # still holds a pipe. Give up on the output rather than the
+            # deadline. The pipes stay open on Windows: its communicate reads
+            # them on threads, and closing a file another thread is reading
+            # blocks on that read's lock.
+            exc.stdout = exc.stderr = None
+            if not IS_WIN:
+                for f in (proc.stdout, proc.stderr):
+                    if f:
+                        f.close()
+        raise
+    except BaseException:
+        kill_tree(proc)
+        raise
+    finally:
+        try:
+            proc.wait(timeout=kill_grace_s)
+        except subprocess.TimeoutExpired:
+            pass   # the root ignored SIGKILL/TerminateProcess; nothing more to do
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)

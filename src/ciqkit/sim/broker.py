@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 import socket
 import sys
@@ -52,6 +53,16 @@ JOB_RETENTION_S = float(os.environ.get("CIQSIM_JOB_RETENTION_S", "900"))
 # the process exits anyway (killing it mid-chunk). Under Client.shutdown's own
 # 30 s wait, so `ciqkit sim shutdown` still sees the broker go.
 SHUTDOWN_GRACE_S = float(os.environ.get("CIQSIM_SHUTDOWN_GRACE_S", "20"))
+# How long restores may keep failing before the jobs the stuck seed gates are
+# failed with the restore error instead of queueing behind it for ever. Time,
+# not a count of attempts: the first retry runs on the very next loop round, so
+# "three attempts" was over within a few seconds -- too short for the transient
+# causes (an editor or indexer holding the file, a sync client) it should ride
+# out. Retries back off from RESTORE_RETRY_MIN_S up to RESTORE_RETRY_MAX_S and
+# go on after the give-up; only the waiting jobs are released.
+RESTORE_GIVE_UP_S = 30.0
+RESTORE_RETRY_MIN_S = 1.0
+RESTORE_RETRY_MAX_S = 10.0
 TERMINAL = {JobState.DONE, JobState.FAILED, JobState.CANCELLED}
 # Chunks that read or drive the screen, so need this job's app (and the screen
 # its earlier chunks navigated to) up when they start.
@@ -61,8 +72,32 @@ SCREEN_KINDS = (ChunkKind.ACT, ChunkKind.SHOT, ChunkKind.REACH, ChunkKind.RECORD
 # throughput -- every op is fast and the queue is what actually serialises work.
 MAX_CONNS = int(os.environ.get("CIQSIM_MAX_CONNS", "64"))
 _CONN_SLOTS = threading.BoundedSemaphore(MAX_CONNS)
+# Longest request line a connection may send. Real requests are a few KiB; a
+# peer that never sends a newline would otherwise grow the handler's buffer
+# without bound for the whole hour the socket may stay open.
+MAX_LINE = 1024 * 1024
+# What a build (and, in TEST_BATCH, the test run after it) is given LESS than
+# the chunk's max_s. _run_chunk joins the worker for exactly max_s, so a call
+# handed the full max_s always loses that race: the job then fails as "chunk
+# exceeded max_s" and the simulator is restarted to free a worker that was only
+# waiting on monkeyc. With the margin the call's own timeout fires first and
+# the job fails cleanly as "build timed out".
+#
+# Both calls go through _compat.run_killing_tree, which on a timeout kills the
+# whole process tree, then gives the output and the reap kill_grace_s (2 s)
+# each, so a call overruns its own timeout by a few seconds at worst. (Plain subprocess.run killed
+# only the Git Bash / cmd.exe wrapper and, on Windows, then waited unbounded
+# on pipes monkeyc's java still held -- which no margin could bound; this was
+# 30 s there.) Windows keeps a little more than POSIX: process teardown and
+# the Toolhelp tree walk are slower there, and that has not been measured on a
+# real build yet.
+BUDGET_MARGIN_S = 10.0 if sys.platform == "win32" else 5.0
 
 log = logging.getLogger("ciqkit.sim.broker")
+
+
+def _bad(what: str) -> dict:
+    return proto.error_reply(proto.E_BAD_REQUEST, f"bad request: {what}")
 
 
 class Broker:
@@ -87,6 +122,17 @@ class Broker:
         self._job_load_gen: dict[str, int] = {}
         self._requests_in_flight = 0    # socket ops between read and reply
         self._restore_pending = False   # a cancel asked for a restore
+        self._restore_failures = 0      # consecutive failed restores
+        self._restore_error = ""        # the last one's message
+        self._restore_failing_since = None  # monotonic time of the first of them
+        self._restore_next_at = 0.0     # monotonic; no retry before this (backoff)
+        # A restore worker that outlived ZOMBIE_GRACE_S. Teardown must not
+        # start a second restore beside it; the seed journal recovers the file.
+        self._restore_wedged = None
+        # Set when the broker stops with a seed patch it could not restore:
+        # WAIT then answers ok=False naming the patch, instead of waiting on a
+        # restore that will never run here.
+        self._restore_abandoned = ""
 
     # ── job selection ─────────────────────────────────────────────────────────
     def _runnable(self):
@@ -120,9 +166,25 @@ class Broker:
         .prg, a gesture -- still preempts as usual, so the urgent path only
         waits when it would otherwise have produced a wrong answer.
         """
-        owner = self.jobs.get(self._seed_job_id) if self._seed_job_id else None
-        if owner is None or owner is j or owner.state in TERMINAL:
+        if self._seed_job_id is not None and self._seed_job_id == j.id:
             return False
+        # A terminal owner releases the gate only once its patch is really out
+        # of the tree. A CANCEL (or a timed-out chunk) merely raises
+        # _restore_pending and the scheduler restores later; a restore that
+        # raised leaves it raised. Until then the seed is live whatever the
+        # owner's state -- or whether it has been reaped from the table.
+        #
+        # That includes a patch with NO owner: a SEED chunk cancelled or timed
+        # out in flight may have patched the tree without ever being recorded
+        # as owner (see _run_chunk). While its restore is pending -- or keeps
+        # failing -- the gate stays up on the tree it named (_seed_app_dir),
+        # or on every built tree if even that is unknown.
+        if not self._restore_pending:
+            if self._seed_job_id is None:
+                return False
+            owner = self.jobs.get(self._seed_job_id)
+            if owner is None or owner.state in TERMINAL:
+                return False
         # The chunk it will really run: a job about to SHOT whose app was
         # pushed over rewinds to its LOAD and builds. Gating only on the
         # literal next chunk let a bumped job rebuild the seeded tree.
@@ -211,8 +273,12 @@ class Broker:
                 # call, and not the idle path either -- that releases the lease.
                 break
             self._restore_if_pending()
+            if self._stop:
+                # A restore that could not be stopped: same as a wedged worker.
+                break
             with self.cond:
                 self._reap_old_jobs_locked()
+                self._fail_seed_gated_locked()
                 job = self._runnable()
                 if job is None:
                     # idle: maybe release the sim lease + consider idle-exit
@@ -220,12 +286,12 @@ class Broker:
                     if not self._non_terminal():
                         idle_for = time.time() - self._last_activity
                         wait = max(1.0, IDLE_EXIT_S - idle_for)
-                        self.cond.wait(timeout=wait)
+                        self.cond.wait(timeout=self._capped_by_restore(wait))
                         if (not self._non_terminal()
                                 and time.time() - self._last_activity >= IDLE_EXIT_S):
                             self._stop = True
                     else:
-                        self.cond.wait(timeout=5.0)
+                        self.cond.wait(timeout=self._capped_by_restore(5.0))
                     continue
                 # leaselib is None where fcntl is missing: there is no lease to
                 # take, and without this guard the loop below spun forever.
@@ -305,21 +371,41 @@ class Broker:
 
     def _run_chunk(self, job: Job, chunk: Chunk):
         box, t = self._in_worker(lambda: self._dispatch(job, chunk), chunk.max_s)
+        # One reading of the worker's liveness for every decision below. Read
+        # twice, a SEED worker finishing between the reads was both recorded as
+        # the live owner and had its restore scheduled -- the next loop round
+        # then restored the patch out from under the job that still needs it.
+        alive = t.is_alive()
         with self.cond:
             self._last_activity = time.time()
             if chunk.kind in (ChunkKind.LOAD, ChunkKind.TEST_BATCH):
                 # Whatever the outcome -- a failed or timed-out push may still
                 # have replaced the running app.
                 self._load_gen += 1
-            if t.is_alive():
+            if chunk.kind == ChunkKind.SEED and self._seed_job_id is None:
+                # Whatever the outcome -- a SEED that timed out, was cancelled
+                # in flight or raised part-way may still have patched the tree,
+                # and then nobody is recorded as its owner. Remember WHICH
+                # tree, so _blocked_by_seed can hold back builds of it (and only
+                # it) until the restore has really run. Never overwritten while
+                # another job owns a live seed: that is its tree, not ours.
+                self._seed_app_dir = _realdir((chunk.args or {}).get("app_dir"))
+                if alive or job.state in TERMINAL or "e" in box:
+                    # It will not be recorded as the owner below, so nobody's
+                    # _finish restores it: schedule the restore here, where the
+                    # patch came from. (The gate kept every other SEED out
+                    # while this ran, so no live owner's patch is in the way.)
+                    self._restore_pending = True
+            if alive:
                 # Hard timeout. The worker is still inside SimSession calls, so
                 # it cannot simply be abandoned: starting the next job's chunk
                 # now would put two threads on the GUI at once. Hand it to the
                 # scheduler loop, which restarts the sim to unblock it and waits
                 # for it to die before running anything else.
                 self._zombie = t
-                self._fail(job, f"chunk '{chunk.kind}' exceeded max_s={chunk.max_s}s",
-                           defer_restore=True)
+                # Its restore, if it owns a seed, is only scheduled (_finish):
+                # the loop reaps this worker before it drains the flag.
+                self._fail(job, f"chunk '{chunk.kind}' exceeded max_s={chunk.max_s}s")
                 self.cond.notify_all()
                 return
             if job.state in TERMINAL:
@@ -339,14 +425,12 @@ class Broker:
             # timed out would otherwise name a job that is already dead as the
             # owner -- an owner whose _finish has been and gone, so nothing
             # would ever restore the patch again. Recorded on this thread, an
-            # unowned patch falls back to "any job's completion restores it",
-            # which is the pre-existing safety net.
+            # unowned patch gets its restore scheduled above instead.
             if chunk.kind == ChunkKind.SEED:
                 self._seed_job_id = job.id
                 self._seed_app_dir = _realdir((chunk.args or {}).get("app_dir"))
             elif chunk.kind == ChunkKind.RESTORE:
-                self._seed_job_id = None
-                self._seed_app_dir = None
+                self._clear_seed_locked()
             elif chunk.kind == ChunkKind.LOAD:
                 self._job_load_gen[job.id] = self._load_gen
             job.results.append({"kind": chunk.kind, "result": box.get("r")})
@@ -380,11 +464,18 @@ class Broker:
         a = chunk.args or {}
         s = self.session
         k = chunk.kind
+        # The chunk's max_s is one budget for everything this chunk calls; see
+        # BUDGET_MARGIN_S for why no call may be handed all of it.
+        t0 = time.monotonic()
+
+        def left() -> float:
+            return max(1.0, chunk.max_s - (time.monotonic() - t0) - BUDGET_MARGIN_S)
+
         if k == ChunkKind.ENSURE:
             return s.ensure(a.get("project", "."))
         if k == ChunkKind.SEED:
             return s.seed(a["app_dir"], a.get("consts"), a.get("patches"),
-                          force=a.get("force", False))
+                          **_given(a, "force"))
         if k == ChunkKind.RESTORE:
             return s.restore()
         if k == ChunkKind.LOAD:
@@ -398,20 +489,21 @@ class Broker:
                 # device, or its seeded tree -- and pushing it reports that
                 # build as this job's verified screen.
                 prg = s.build(a["app_dir"], a.get("device", job.device),
-                              timeout_s=chunk.max_s)
+                              timeout_s=left())
                 built = True
             # A freshly-built prg must be pushed even if the same app is "warm":
             # build.sh writes the SAME output path each time, so warm-skip (keyed
             # on app+device) would otherwise show the previous screen's build.
             return s.load(job.app, prg, a.get("device", job.device),
                           project=a.get("project"),
-                          force=a.get("force", False) or built,
                           anchor=a.get("anchor"),
-                          storage_start=a.get("storage", "fresh"),
+                          # A fresh build is always pushed (see above); else
+                          # the chunk's own force, else the session default.
+                          **({"force": True} if built else _given(a, "force")),
+                          **({"storage_start": a["storage"]} if "storage" in a else {}),
                           **_given(a, "fit"))
         if k == ChunkKind.ACT:
-            return s.act(a.get("kind", "tap"),
-                         **_given(a, "x", "y", "direction", "key", "confirm",
+            return s.act(**_given(a, "kind", "x", "y", "direction", "key", "confirm",
                                   "anchor", "retries", "hold", "path"),
                          **({"swipe": sw} if a.get("kind") == "swipe"
                             and (sw := proto.swipe_spec(a)) else {}),
@@ -438,9 +530,14 @@ class Broker:
                 # Same place LOAD builds: inside the session, on the scheduler
                 # thread. tests=True selects the `monkeyc -t` variant.
                 prg = s.build(a["app_dir"], a.get("device", job.device),
-                              timeout_s=chunk.max_s, tests=True)
+                              timeout_s=left(), tests=True)
+            # What the build left over, not max_s afresh: handing both calls
+            # the whole budget let build + tests run up to twice max_s, so any
+            # run needing more than max_s in total hit the zombie path and a
+            # simulator restart instead of failing as a test timeout. run_tests
+            # spends it as one deadline (ensure, port wait, retry included).
             return s.run_tests(prg, a.get("device", job.device),
-                               timeout_s=chunk.max_s)
+                               timeout_s=left())
         raise SimError(f"unknown chunk kind {k}")
 
     # ── resume: rewind to the job's own LOAD ──────────────────────────────────
@@ -517,11 +614,12 @@ class Broker:
         del job.results[ix:]
 
     # ── terminal transitions ──────────────────────────────────────────────────
-    def _fail(self, job: Job, reason: str, defer_restore: bool = False):
+    def _fail(self, job: Job, reason: str):
         job.error = reason
-        self._finish(job, JobState.FAILED, defer_restore=defer_restore)
+        self._finish(job, JobState.FAILED)
 
-    def _finish(self, job: Job, state: str, defer_restore: bool = False):
+    def _finish(self, job: Job, state: str):
+        """Caller holds the lock. Never touches the session."""
         # A job that is already terminal keeps the state it was given. Without
         # this, cancelling a job whose last chunk is in flight reports back as
         # DONE — a cancel the user watched succeed, contradicted by the result.
@@ -532,39 +630,167 @@ class Broker:
         # applied the patch may undo it — restoring here unconditionally would
         # rip an active seed out from under a *different* job that is merely
         # paused between chunks, and its next build would come out unseeded.
-        if self._seed_job_id in (None, job.id):
-            if defer_restore:
-                # The worker whose chunk timed out is still inside the session.
-                # Restoring from here would put a second thread on it; the
-                # scheduler reaps the worker first, then drains this flag.
-                self._restore_pending = True
-            else:
-                self._restore_now()
+        # An unowned patch (_seed_job_id None) is not this job's either: its
+        # restore was scheduled where it was applied (_run_chunk), and with
+        # the owner-less gate every job it holds back is failed through here --
+        # restoring per failed job ran them back to back, ignoring the backoff.
+        #
+        # Scheduled, never run inline: the caller holds the lock, and a
+        # restore under it (up to ZOMBIE_GRACE_S) blocked every STATUS, CANCEL
+        # and WAIT past the client's timeout. _restore_if_pending runs it at
+        # the top of the next loop round, outside the lock, after reaping a
+        # timed-out worker that may still be inside the session; meanwhile the
+        # raised flag keeps the gate up.
+        if self._seed_job_id is not None and self._seed_job_id == job.id:
+            self._restore_pending = True
         if self._last_job_id == job.id:
             self._last_job_id = None
         self._job_load_gen.pop(job.id, None)
 
     def _restore_now(self):
-        """Undo the active seed. Scheduler thread only; idempotent."""
-        try:
-            self.session.restore()
-        except Exception:
-            log.exception("restoring a seeded file failed")
+        """Undo the active seed. Scheduler thread only, WITHOUT the lock (via
+        _restore_if_pending): a restore can take up to ZOMBIE_GRACE_S, and every
+        op handler needs the lock -- held across it, STATUS, CANCEL and WAIT
+        outwaited the client's cheap-RPC timeout. Releasing it is safe because
+        only this thread runs chunks or touches the session, and
+        _restore_pending stays raised until the restore has succeeded, so the
+        seed gate is up throughout. Idempotent.
+
+        Bounded like every other session call the scheduler makes: a restore
+        is file writes plus a `git diff`, but on a hung network share or a
+        wedged git it would otherwise block the scheduler thread -- the broker
+        then accepts jobs it never runs. A restore still running after
+        ZOMBIE_GRACE_S stops the broker, as a wedged chunk worker does: the
+        worker is inside the session, so nothing else may be started beside it.
+        """
+        if self._restore_wedged is not None:
+            # One is still stuck inside the session and the broker is stopping;
+            # a second restore beside it could interleave their file writes.
+            return
+        box, t = self._in_worker(self.session.restore, ZOMBIE_GRACE_S)
+        if t.is_alive():
+            log.error("restoring a seeded file is still running after %.0fs; "
+                      "stopping the broker rather than run beside it",
+                      ZOMBIE_GRACE_S)
+            self._restore_wedged = t
+            with self.cond:
+                self._restore_pending = True    # the gate stays up until exit
+            self._fail_live(
+                f"restoring a seeded file did not finish within "
+                f"{ZOMBIE_GRACE_S:.0f}s, so the broker stopped rather than run "
+                f"another job beside it. Run `ciqkit sim restore` (it replays "
+                f"the seed journal), then re-submit.")
+            return
+        if "e" in box:
+            e = box["e"]
+            if not isinstance(e, Exception):
+                raise e     # SystemExit & co. stay fatal, as on this thread before
+            # The patch is still in the tree (the session keeps its backup), so
+            # the seed gate must stay up: clearing it here let the next job
+            # build the seeded source and report the result as verified.
+            # Re-raising the flag is also the retry -- the scheduler loop
+            # drains it again, after a backoff, while the owner is terminal
+            # and no _finish of the owner will come round again.
+            # Full traceback once; the retries would fill brokerd.log with
+            # the same one.
+            first = self._restore_failures == 0
+            if first:
+                log.error("restoring a seeded file failed; will retry\n%s",
+                          box.get("tb", ""))
+            else:
+                log.warning("restoring a seeded file failed again: %s", e)
+            with self.cond:
+                now = time.monotonic()
+                if self._restore_failing_since is None:
+                    self._restore_failing_since = now
+                self._restore_failures += 1
+                self._restore_error = f"{type(e).__name__}: {e}"
+                self._restore_pending = True
+                # Exponential backoff: back-to-back retries cannot outlast a
+                # transient cause, they only use up the give-up window.
+                delay = min(RESTORE_RETRY_MAX_S,
+                            RESTORE_RETRY_MIN_S * 2 ** min(self._restore_failures - 1, 16))
+                self._restore_next_at = now + delay
+            return
+        with self.cond:
+            self._clear_seed_locked()
+            self.cond.notify_all()
+
+    def _clear_seed_locked(self):
+        """The patch is out of the tree: drop the seed and everything that
+        tracks its restore, together. Clearing the seed alone left
+        _restore_pending raised with no tree named, which gates EVERY build --
+        and a failure clock past RESTORE_GIVE_UP_S then failed those jobs as
+        "could not be restored after 0 attempts". Caller holds the lock."""
         self._seed_job_id = None
         self._seed_app_dir = None
+        self._restore_pending = False
+        self._restore_failures = 0
+        self._restore_error = ""
+        self._restore_failing_since = None
+        self._restore_next_at = 0.0
+
+    def _restore_gave_up(self) -> bool:
+        """Has the restore been failing for longer than RESTORE_GIVE_UP_S?"""
+        return (self._restore_failing_since is not None
+                and time.monotonic() - self._restore_failing_since >= RESTORE_GIVE_UP_S)
+
+    def _fail_seed_gated_locked(self):
+        """Fail the jobs a restore that keeps failing holds back.
+
+        The gate must stay up (the patch is still in the tree), but queueing
+        behind it for ever left every seeding or building job QUEUED with no
+        word on why. Once restores have been failing for RESTORE_GIVE_UP_S they
+        fail with the restore error; the retries go on, and a later job is
+        judged afresh. Caller holds the lock.
+        """
+        if not self._restore_pending or not self._restore_gave_up():
+            return
+        failed = False
+        for j in list(self.jobs.values()):
+            if (j.state not in TERMINAL and j.chunk_ix < len(j.chunks)
+                    and self._blocked_by_seed(j)):
+                self._fail(j, f"a seeded file could not be restored after "
+                              f"{self._restore_failures} attempts over "
+                              f"{RESTORE_GIVE_UP_S:.0f}s "
+                              f"({self._restore_error}); fix the file (the broker keeps "
+                              "retrying), or run `ciqkit sim shutdown` and then "
+                              "`ciqkit sim restore`, which replays the seed journal")
+                failed = True
+        if failed:
+            self.cond.notify_all()
+
+    def _restore_retry_in(self) -> float | None:
+        """Seconds until a pending restore is due again; None if none is
+        pending. Caller holds the lock. The idle wait is capped by it so a
+        backed-off retry runs on time instead of at the next 5 s tick."""
+        if not self._restore_pending:
+            return None
+        return max(0.0, self._restore_next_at - time.monotonic())
+
+    def _capped_by_restore(self, wait: float) -> float:
+        """``wait``, shortened so a backed-off restore retry is not late.
+        Caller holds the lock."""
+        due = self._restore_retry_in()
+        return wait if due is None else min(wait, max(0.05, due))
 
     def _restore_if_pending(self):
-        """Honour a restore a CANCEL asked for.
+        """Honour a restore a CANCEL asked for, or retry one that failed.
 
         The CANCEL handler runs on a server thread, which must never touch the
         session, so it only raises the flag; the actual restore happens here.
         Without it a job cancelled after its SEED chunk leaves the user's source
-        patched until some *other* job happens to finish.
+        patched until some *other* job happens to finish. A retry waits out its
+        backoff: this returns at once until then, so the loop keeps scheduling
+        work the stuck seed does not gate. The flag is left raised while the
+        restore runs: _restore_now clears it with the seed on success, and a
+        failure keeps it.
         """
         with self.cond:
             if not self._restore_pending:
                 return
-            self._restore_pending = False
+            if time.monotonic() < self._restore_next_at:
+                return
         self._restore_now()
 
     def _reap_zombie(self):
@@ -586,10 +812,29 @@ class Broker:
             return
         log.warning("a chunk timed out and its worker is still running; "
                     "restarting the simulator to unblock it")
-        try:
-            self.session.restart()
-        except Exception:
-            log.exception("restart while reaping a timed-out worker failed")
+        # On a worker of its own, bounded like every other session call: a
+        # restart that hangs (a simulator that will not die, a stuck relaunch)
+        # used to block this thread for good -- a broker that accepts jobs and
+        # never runs them. A restart still running after the grace is a second
+        # wedged thread in the session, so it ends the broker like the first.
+        rbox, rt = self._in_worker(self.session.restart, ZOMBIE_GRACE_S)
+        if rt.is_alive():
+            log.error("restarting the simulator to free a timed-out worker is "
+                      "itself still running after %.0fs; stopping the broker",
+                      ZOMBIE_GRACE_S)
+            self._fail_live(
+                f"a chunk timed out and the simulator restart meant to free it "
+                f"did not finish within {ZOMBIE_GRACE_S:.0f}s, so the broker "
+                f"stopped rather than drive the simulator from two threads. "
+                f"Re-submit; a fresh broker starts on demand.")
+            return
+        if "e" in rbox:
+            if not isinstance(rbox["e"], Exception):
+                # SystemExit & co. stay fatal, as when this ran on this thread:
+                # scheduler() turns them into "fail everything and stop".
+                raise rbox["e"]
+            log.error("restart while reaping a timed-out worker failed\n%s",
+                      rbox.get("tb", ""))
         deadline = time.time() + ZOMBIE_GRACE_S
         while t.is_alive() and time.time() < deadline:
             t.join(1.0)
@@ -626,6 +871,9 @@ class Broker:
                  if j.state in TERMINAL and (j.finished or 0) < cutoff]
         for jid in stale:
             del self.jobs[jid]
+            # A job cancelled while PAUSED never passes through _finish, so its
+            # load generation would otherwise outlive the job forever.
+            self._job_load_gen.pop(jid, None)
 
     # ── sim-lease busy/idle ────────────────────────────────────────────────────
     def _go_busy(self) -> str | None:
@@ -691,26 +939,53 @@ class Broker:
         # Restore any active SEED_* patch before we go away, so a shutdown or a
         # SIGTERM (e.g. pkill) never leaves SEED_*=true / a stray source patch in
         # the tree. SIGKILL can't be caught — that still needs a manual revert.
-        try:
-            self.session.restore()
-        except Exception:
-            pass
-        self._seed_job_id = None
-        self._seed_app_dir = None
+        # Bounded, so a hung restore cannot keep a stopping daemon alive; and
+        # skipped beside a restore already wedged in the session -- the seed
+        # journal still holds the original for `ciqkit sim restore`.
+        wedged = self._restore_wedged
+        failed = ""
+        if wedged is not None and wedged.is_alive():
+            failed = "an earlier restore is still stuck"
+        else:
+            box, t = self._in_worker(self.session.restore, ZOMBIE_GRACE_S)
+            if t.is_alive() or "e" in box:
+                failed = "timed out" if t.is_alive() else f"failed: {box['e']}"
+        if failed:
+            log.error("restoring seeds at exit: %s; run `ciqkit sim restore` "
+                      "to replay the seed journal", failed)
         with self.cond:
+            if failed:
+                # The patch may still be in the source: keep the seed state, so
+                # a WAIT on its owner never reads ok=True, and say why.
+                self._restore_abandoned = (
+                    f"restoring it at broker exit {failed}; run `ciqkit sim restore`, "
+                    "which replays the seed journal")
+            else:
+                self._clear_seed_locked()
             self._go_idle_locked()
+            self.cond.notify_all()      # waiters re-judge now, not at their next poll
 
     # ── op handlers (called from server threads) ───────────────────────────────
     def handle(self, req: dict) -> dict:
+        # Malformed requests answer "bad request: <what>" rather than the text
+        # of whatever exception the missing key raised further down ("'list'
+        # object has no attribute 'get'", "'job_id'"), which named no field.
+        if not isinstance(req, dict):
+            return _bad("the request must be a JSON object")
         op = req.get("op")
+        if op in (Op.WAIT, Op.BUMP, Op.CANCEL) and not isinstance(req.get("job_id"), str):
+            return _bad(f"{op} needs a string job_id")
         if op == Op.PING:
             return {"ok": True, "pid": os.getpid(),
                     "uptime_s": time.time() - _START}
         if op == Op.SUBMIT:
+            if not isinstance(req.get("job"), dict):
+                return _bad("submit needs a job object")
             job = Job.from_dict(req["job"])
             errs = proto.validate_job(job)
             if errs:
-                return {"ok": False, "error": "invalid job: " + "; ".join(errs)}
+                return proto.error_reply(proto.E_INVALID,
+                                         "invalid job: " + "; ".join(errs))
             with self.cond:
                 if self._stop:
                     # Told to stop, but the accept loop can still take
@@ -720,12 +995,13 @@ class Broker:
                     # can resubmit there. Checked under the lock: idle-exit sets
                     # _stop under it, and a check before taking it let a submit
                     # slip into a broker that had already decided to exit.
-                    return {"ok": False, "error": proto.ERR_SHUTTING_DOWN}
+                    return proto.error_reply(proto.E_SHUTTING_DOWN,
+                                             proto.ERR_SHUTTING_DOWN)
                 if job.id in self.jobs:
                     # The id is client-chosen. Accepting a duplicate replaced
                     # the live entry -- possibly a RUNNING job -- in the table.
-                    return {"ok": False,
-                            "error": f"a job with id {job.id} already exists"}
+                    return proto.error_reply(
+                        proto.E_INVALID, f"a job with id {job.id} already exists")
                 # The aging clock starts when WE accept the job. Job.from_dict
                 # already refuses to read it from the wire; this is the second
                 # half of the same rule, stated where the clock actually starts.
@@ -737,21 +1013,31 @@ class Broker:
                 self.cond.notify_all()
             return {"ok": True, "job_id": job.id}
         if op == Op.WAIT:
-            return self._wait(req["job_id"], float(req.get("timeout_s", 600)))
+            timeout_s = req.get("timeout_s", 600)
+            # bool is an int subclass; True is not a timeout anyone meant.
+            if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
+                    or not math.isfinite(timeout_s)):
+                return _bad("wait timeout_s must be a finite number")
+            return self._wait(req["job_id"], float(timeout_s))
         if op == Op.STATUS:
             with self.lock:
                 jobs = [self._job_brief(j) for j in self.jobs.values()]
                 cur = self._last_job_id
+            # Read once: the scheduler thread reassigns session.current without
+            # our lock (a restart sets it to None), so testing it and then
+            # reading it again could land on None between the two and turn a
+            # status call into "'NoneType' object is not iterable".
+            loaded = self.session.current
             return {"ok": True, "jobs": jobs, "current": cur,
-                    "loaded": list(self.session.current) if self.session.current else None}
+                    "loaded": list(loaded) if loaded else None}
         if op == Op.BUMP:
             with self.cond:
                 j = self.jobs.get(req["job_id"])
                 if not j:
-                    return {"ok": False, "error": "no such job"}
+                    return proto.error_reply(proto.E_NO_SUCH_JOB, "no such job")
                 prio = req.get("priority", int(proto.Priority.URGENT))
                 if (e := proto.validate_priority(prio)) is not None:
-                    return {"ok": False, "error": e}
+                    return proto.error_reply(proto.E_INVALID, e)
                 j.priority = prio
                 self.cond.notify_all()
             return {"ok": True, "priority": j.priority}
@@ -759,7 +1045,7 @@ class Broker:
             with self.cond:
                 j = self.jobs.get(req["job_id"])
                 if not j:
-                    return {"ok": False, "error": "no such job"}
+                    return proto.error_reply(proto.E_NO_SUCH_JOB, "no such job")
                 if j.state not in TERMINAL:
                     j.state = JobState.CANCELLED
                     j.finished = time.time()
@@ -782,7 +1068,7 @@ class Broker:
                             f"before it ran to completion; re-submit it",
                             keep_running=True)
             return {"ok": True}
-        return {"ok": False, "error": f"unknown op {op}"}
+        return proto.error_reply(proto.E_BAD_REQUEST, f"unknown op {op}")
 
     def _wait(self, job_id: str, timeout_s: float) -> dict:
         deadline = time.time() + timeout_s
@@ -790,13 +1076,30 @@ class Broker:
             while True:
                 j = self.jobs.get(job_id)
                 if j is None:
-                    return {"ok": False, "error": "no such job"}
+                    return proto.error_reply(proto.E_NO_SUCH_JOB, "no such job")
                 if j.state in TERMINAL:
-                    return {"ok": j.state == JobState.DONE, "job": self._job_full(j)}
+                    owns_patch = self._seed_job_id == j.id and self._restore_pending
+                    if not (owns_patch and not self._restore_gave_up()
+                            and self._restore_wedged is None
+                            and not self._restore_abandoned):
+                        # A seed owner's restore runs at the top of the next
+                        # loop round, not in _finish (outside the lock). Its
+                        # waiters are answered once the patch is out of the
+                        # source -- or with ok=False and why, once restoring
+                        # it has been failing past RESTORE_GIVE_UP_S: "done"
+                        # with the user's source still patched is a result
+                        # nobody should act on unverified.
+                        reply = {"ok": j.state == JobState.DONE and not owns_patch,
+                                 "job": self._job_full(j)}
+                        if owns_patch:
+                            reply["error"] = (
+                                "this job's seed patch is still in the source: "
+                                f"{self._restore_abandoned or self._restore_error or 'restore pending'}")
+                        return reply
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return {"ok": False, "error": "wait timeout",
-                            "job": self._job_full(j)}
+                    return proto.error_reply(proto.E_WAIT_TIMEOUT, "wait timeout",
+                                             job=self._job_full(j))
                 self.cond.wait(timeout=min(remaining, 2.0))
 
     def _job_brief(self, j: Job) -> dict:
@@ -1007,8 +1310,8 @@ def serve(sock_path: str | None = None):
             if not _CONN_SLOTS.acquire(blocking=False):
                 log.warning("refusing a connection: all %d handler slots are "
                             "busy", MAX_CONNS)
-                _refuse(conn, {"ok": False, "error": "broker is out of connection "
-                                                     "slots; retry shortly"})
+                _refuse(conn, proto.error_reply(
+                    proto.E_BUSY, "broker is out of connection slots; retry shortly"))
                 continue
             threading.Thread(target=_handle_conn, args=(broker, conn, listener),
                              daemon=True).start()
@@ -1079,10 +1382,23 @@ def _handle_conn(broker: Broker, conn: socket.socket,
                 if not listener.authenticate(f):
                     log.warning("refused a connection that did not authenticate")
                     f.close()
-                    _refuse(conn, {"ok": False, "error": "unauthorized"})
+                    _refuse(conn, proto.error_reply(proto.E_UNAUTHORIZED, "unauthorized"))
                     return
                 conn.settimeout(3600)
-            for line in f:
+            while True:
+                # Bounded read: `for line in f` buffers until a newline, however
+                # far away, so one peer could make this thread hold any amount
+                # of memory. A line longer than MAX_LINE is refused and the
+                # connection dropped -- its tail is not a request boundary we
+                # could resynchronise on.
+                line = f.readline(MAX_LINE + 1)
+                if not line:
+                    break
+                if len(line) > MAX_LINE:
+                    log.warning("refused a request line over %d bytes", MAX_LINE)
+                    f.close()
+                    _refuse(conn, _bad(f"request line exceeds {MAX_LINE} bytes"))
+                    return
                 if not line.strip():
                     continue
                 with broker.cond:
@@ -1090,9 +1406,14 @@ def _handle_conn(broker: Broker, conn: socket.socket,
                 try:
                     try:
                         req = proto.loads(line)
-                        resp = broker.handle(req)
-                    except Exception as e:  # noqa: BLE001
-                        resp = {"ok": False, "error": str(e)}
+                    except ValueError as e:     # not JSON, or not UTF-8
+                        resp = proto.error_reply(proto.E_BAD_REQUEST, str(e))
+                    else:
+                        try:
+                            resp = broker.handle(req)
+                        except Exception as e:  # noqa: BLE001
+                            log.exception("request handler failed")
+                            resp = proto.error_reply(proto.E_INTERNAL, str(e))
                     conn.sendall(proto.dumps(resp))
                 finally:
                     with broker.cond:

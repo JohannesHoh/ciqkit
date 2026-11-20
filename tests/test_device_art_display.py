@@ -258,7 +258,7 @@ def test_the_declared_display_rect_is_found_on_a_cut_off_capture(tmp_path, monke
     the strap off at the bottom; the display must still be located exactly."""
     from PIL import Image
     from ciqkit.capture import framing
-    from ciqkit.sim import preflight
+    from ciqkit import sdk as preflight
     art = _fake_device(tmp_path)
     monkeypatch.setattr(preflight, "devices_root", lambda: str(tmp_path))
     cap = Image.new("RGB", (330, 380), (255, 255, 255))
@@ -269,7 +269,7 @@ def test_the_declared_display_rect_is_found_on_a_cut_off_capture(tmp_path, monke
 def test_a_capture_that_is_not_that_device_at_1x_is_refused(tmp_path, monkeypatch):
     from PIL import Image
     from ciqkit.capture import framing
-    from ciqkit.sim import preflight
+    from ciqkit import sdk as preflight
     art = _fake_device(tmp_path)
     monkeypatch.setattr(preflight, "devices_root", lambda: str(tmp_path))
     retina = Image.new("RGB", (700, 900), (255, 255, 255))

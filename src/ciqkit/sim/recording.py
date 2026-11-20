@@ -29,7 +29,7 @@ def gif_durations(stamps: list[float], overhead_gaps: set[int], interval_ms: int
     # delta rather than the requested interval, which is a floor the grab
     # never reaches and would flash the final frame past in a few ms.
     wall.append(wall[-1] if wall else interval_ms)
-    return _compress_durations(wall, playback_ms)
+    return compress_durations(wall, playback_ms)
 
 
 def _contact_sheet(imgs, path: str, cols: int = 6, tile_w: int = 227):
@@ -69,7 +69,7 @@ def _flatten_overhead_gaps(wall_ms: list[int], overhead: set[int]) -> list[int]:
     At the old ~0.5 fps those hid inside a two-second frame time. At ~4.6 fps
     they do not: measured on a real clip, the refocus frame held for 1450 ms
     against a 170 ms median -- a 8x freeze punched into the playback every
-    ~5 s, in a clip whose whole point is watching motion. `_compress_durations`
+    ~5 s, in a clip whose whole point is watching motion. `compress_durations`
     cannot help, because a healthy clip is already faster than `playback_ms`
     and passes through untouched, and its [20, 1000] ms clamp only applies on
     the branch that scales.
@@ -93,7 +93,7 @@ def _flatten_overhead_gaps(wall_ms: list[int], overhead: set[int]) -> list[int]:
             for i, d in enumerate(wall_ms)]
 
 
-def _compress_durations(wall_ms: list[int], playback_ms: int) -> tuple[list[int], float]:
+def compress_durations(wall_ms: list[int], playback_ms: int) -> tuple[list[int], float]:
     """Scale wall-clock frame durations into a playable GIF timing track.
 
     Keeps the RATIOS between frames (so a real pause still reads as a pause) but
@@ -169,3 +169,7 @@ def _parse_test_output(out: str) -> dict:
     if ran == 0:
         res["reason"] = "zero-tests"
     return res
+
+
+# Old private name, still imported by tests and any out-of-tree caller.
+_compress_durations = compress_durations

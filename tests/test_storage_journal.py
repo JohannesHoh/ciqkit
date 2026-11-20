@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from ciqkit.sim import storage
+from ciqkit.sim import storage, storage_cli
 
 
 CRASH = """---
@@ -185,14 +185,14 @@ def test_storage_run_keep_inherits(sim):
 
 def test_cli_snap_check_restore(sim, capsys):
     sim("CAP-VENU3", b"v1")
-    assert storage.main(["snap", "cap-venu3.prg", "--kind", "test", "--start", "fresh"]) == 0
+    assert storage_cli.main(["snap", "cap-venu3.prg", "--kind", "test", "--start", "fresh"]) == 0
     sid = capsys.readouterr().out.strip()
     assert storage.storage_files("CAP-VENU3") == []
     sim.log(CRASH)
-    assert storage.main(["check", sid]) == 3
-    assert storage.main(["restore", "CAP-VENU3@latest"]) == 0
+    assert storage_cli.main(["check", sid]) == 3
+    assert storage_cli.main(["restore", "CAP-VENU3@latest"]) == 0
     assert _read(sim.root, "DATA/CAP-VENU3.DAT") == b"v1.DAT"
-    assert storage.main(["list"]) == 0
+    assert storage_cli.main(["list"]) == 0
 
 
 def test_cold_loads_and_test_runs_default_to_fresh_storage():
@@ -203,7 +203,10 @@ def test_cold_loads_and_test_runs_default_to_fresh_storage():
     from ciqkit.sim import broker, session
     assert inspect.signature(session.SimSession.load).parameters[
         "storage_start"].default == "fresh"
-    assert 'a.get("storage", "fresh")' in inspect.getsource(broker.Broker._dispatch)
+    # The broker forwards `storage` only when a chunk carries it (see
+    # test_scheduler.test_dispatch_forwards_only_given_session_kwargs), so the
+    # signature default above is the one a cold LOAD gets.
+    assert '"fresh"' not in inspect.getsource(broker.Broker._dispatch)
     assert '"test", "fresh"' in inspect.getsource(session.SimSession.run_tests)
 
 

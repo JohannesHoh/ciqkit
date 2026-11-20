@@ -60,6 +60,21 @@ DEFAULT_PLAYBACK_MS = 500
 # jobs.py both read it, so the CLI and MCP paths cannot disagree with it.
 DEFAULT_SHOT_SETTLE_S = 0.35
 
+# Default (expected_s, max_s) per chunk kind -- the one copy. jobs.py builders
+# and Chunk.from_dict both read it, so a chunk that arrives without budgets
+# (a hand-written job over the wire) gets the same ones a builder would give.
+# TEST_BATCH is the build case; jobs.py lowers max_s for a prebuilt --prg.
+# Kinds with computed budgets (act, reach, record, seed) fall to the fallback.
+FALLBACK_BUDGET: tuple[float, float] = (15.0, 120.0)
+CHUNK_BUDGETS: dict[str, tuple[float, float]] = {
+    ChunkKind.ENSURE: (5.0, 60.0),
+    ChunkKind.LOAD: (40.0, 300.0),
+    ChunkKind.SHOT: (15.0, 120.0),
+    ChunkKind.RESTORE: (1.0, 30.0),
+    ChunkKind.TEST_BATCH: (120.0, 900.0),
+}
+DEFAULT_DEVICE = "venu3"
+
 
 @dataclass
 class Chunk:
@@ -74,11 +89,16 @@ class Chunk:
 
     @staticmethod
     def from_dict(d: dict) -> Chunk:
+        kind = d["kind"]
+        # An unhashable kind (a list from a hostile client) must not raise here:
+        # validate_job is what reports it, and it needs the Chunk to exist.
+        exp, mx = (CHUNK_BUDGETS.get(kind, FALLBACK_BUDGET)
+                   if isinstance(kind, str) else FALLBACK_BUDGET)
         return Chunk(
-            kind=d["kind"],
+            kind=kind,
             args=d.get("args", {}) or {},
-            expected_s=float(d.get("expected_s", 15.0)),
-            max_s=float(d.get("max_s", 120.0)),
+            expected_s=float(d.get("expected_s", exp)),
+            max_s=float(d.get("max_s", mx)),
         )
 
 
@@ -96,7 +116,7 @@ class Job:
     app: str                          # app id (folderName) the job targets
     chunks: list                      # list[Chunk]
     priority: int = Priority.NORMAL
-    device: str = "venu3"
+    device: str = DEFAULT_DEVICE
     owner: str = ""                   # session id -- who submitted (visibility)
     label: str = ""                   # human tag for status output
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -218,7 +238,7 @@ class Job:
             app=d["app"],
             chunks=chunks,
             priority=int(d.get("priority", Priority.NORMAL)),
-            device=d.get("device", "venu3"),
+            device=d.get("device", DEFAULT_DEVICE),
             owner=d.get("owner", ""),
             label=d.get("label", ""),
             id=d.get("id") or uuid.uuid4().hex[:12],
@@ -460,6 +480,54 @@ class Op:
 # What a broker that has been told to stop answers a SUBMIT with. A client that
 # sees it waits for that broker to exit and submits to a fresh one.
 ERR_SHUTTING_DOWN = "broker is shutting down"
+
+# Every error reply is {"ok": false, "error": <human text>, "code": <one of
+# these>}. Front-ends branch on the code; the text is for people and may change.
+# Matching the text instead is how a reworded message silently turned a retry
+# into a failure.
+E_SHUTTING_DOWN = "shutting_down"   # told to stop: wait for it to exit, resubmit
+E_NO_SUCH_JOB = "no_such_job"       # unknown id (never submitted, or reaped)
+E_INVALID = "invalid"               # well-formed request, unacceptable job/value
+E_BAD_REQUEST = "bad_request"       # malformed request: not JSON, wrong types, op
+E_WAIT_TIMEOUT = "wait_timeout"     # WAIT gave up; the job is still live (reply has it)
+E_UNAUTHORIZED = "unauthorized"     # the TCP transport's token check failed
+E_BUSY = "busy"                     # out of connection slots; retry shortly
+E_INTERNAL = "internal"             # the broker failed answering, or no `code` at all
+ERROR_CODES = frozenset({E_SHUTTING_DOWN, E_NO_SUCH_JOB, E_INVALID, E_BAD_REQUEST,
+                         E_WAIT_TIMEOUT, E_UNAUTHORIZED, E_BUSY, E_INTERNAL})
+
+# A broker from before codes answers with text alone. Its exact messages, and
+# the prefixes of the ones it built, so a newer client still tells them apart.
+_LEGACY_EXACT = {ERR_SHUTTING_DOWN: E_SHUTTING_DOWN, "no such job": E_NO_SUCH_JOB,
+                 "wait timeout": E_WAIT_TIMEOUT, "unauthorized": E_UNAUTHORIZED}
+_LEGACY_PREFIX = (("bad request: ", E_BAD_REQUEST), ("unknown op ", E_BAD_REQUEST),
+                  ("invalid job: ", E_INVALID),
+                  ("broker is out of connection slots", E_BUSY))
+
+
+def error_reply(code: str, message: str, **extra) -> dict:
+    """The one shape of an error answer: ``ok`` false, human ``error``, ``code``."""
+    return {"ok": False, "error": message, "code": code, **extra}
+
+
+def error_code(reply: dict) -> str | None:
+    """The code of an error reply; None when ``reply`` carries no error.
+
+    A reply without ``code`` comes from an older broker: its text is matched
+    against the messages that broker sent, and anything else is ``internal``.
+    """
+    if not isinstance(reply, dict) or not reply.get("error") or reply.get("ok"):
+        return None
+    code = reply.get("code")
+    if isinstance(code, str) and code:
+        return code
+    text = str(reply["error"])
+    if text in _LEGACY_EXACT:
+        return _LEGACY_EXACT[text]
+    for prefix, c in _LEGACY_PREFIX:
+        if text.startswith(prefix):
+            return c
+    return E_INTERNAL
 
 
 def dumps(obj: dict) -> bytes:

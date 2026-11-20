@@ -89,7 +89,7 @@ def test_session_build_runs_monkeyc_fallback(sdk, proj, key, monkeypatch):
         (proj / "bin" / "MyApp.prg").write_text("p")
         return R()
 
-    monkeypatch.setattr(sess.subprocess, "run", fake_run)
+    monkeypatch.setattr(sess._compat, "run_killing_tree", fake_run)
     out = sess.SimSession.__new__(sess.SimSession).build(str(proj), "venu3")
     assert out.endswith("bin/MyApp.prg")
     assert seen["argv"][0] == str(sdk / "bin" / MONKEYC) and seen["cwd"] == str(proj)

@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 
+from .. import _compat
 from . import seedjournal
 from .errors import SimError
 
@@ -127,19 +128,37 @@ def _seed_target(app_dir: str, rel: str) -> str:
     return full
 
 
+# Per git call. These run inside a broker SEED / RESTORE chunk; an index lock
+# held by another git, a credential or pager prompt on a misconfigured repo, or
+# a slow network share would otherwise hold the chunk until its worker timed
+# out -- and a restore until the broker stopped. A healthy call takes
+# milliseconds.
+GIT_TIMEOUT_S = 10.0
+
+
 def _git_status(path: str) -> str:
-    """'clean' | 'dirty' | 'untracked' | 'no-git' for one file."""
+    """'clean' | 'dirty' | 'untracked' | 'no-git' | 'unknown' for one file.
+
+    'unknown' is git not answering within GIT_TIMEOUT_S.
+    """
     d = os.path.dirname(path) or "."
+
+    def git(*args):
+        # run_killing_tree, not subprocess.run: Git for Windows' cmd\\git.exe
+        # hands its pipes to a child, and subprocess.run waits on them
+        # untimed after killing only the launcher.
+        return _compat.run_killing_tree(["git", *args], cwd=d, capture_output=True,
+                                        stdin=subprocess.DEVNULL, timeout=GIT_TIMEOUT_S)
     try:
-        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "--", path],
-                                 cwd=d, capture_output=True)
+        tracked = git("ls-files", "--error-unmatch", "--", path)
         if tracked.returncode != 0:
-            inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                                    cwd=d, capture_output=True)
+            inside = git("rev-parse", "--is-inside-work-tree")
             return "untracked" if inside.returncode == 0 else "no-git"
-        r = subprocess.run(["git", "diff", "--quiet", "--", path],
-                           cwd=d, capture_output=True)
+        r = git("diff", "--quiet", "--", path)
         return "clean" if r.returncode == 0 else "dirty"
+    except subprocess.TimeoutExpired:
+        log.warning("git did not answer within %.0fs for %s", GIT_TIMEOUT_S, path)
+        return "unknown"
     except OSError:
         return "no-git"   # git is not installed; the journal still covers us
 
@@ -154,7 +173,15 @@ def _refuse_if_dirty(path: str, force: bool) -> None:
     """
     if force:
         return
-    if _git_status(path) == "dirty":
+    status = _git_status(path)
+    if status == "unknown":
+        # Could not tell clean from dirty, so the guard refuses as it would for
+        # dirty: guessing "clean" is how uncommitted work ends up journal-only.
+        raise SimError(
+            f"git did not answer within {GIT_TIMEOUT_S:.0f}s, so ciqkit cannot "
+            f"tell whether {path} has uncommitted changes. Check for a stuck "
+            f"git (an index.lock), or pass force to seed anyway.")
+    if status == "dirty":
         raise SimError(
             f"{path} has uncommitted changes. Seeding rewrites it and restores "
             f"it afterwards, but a SIGKILL mid-job would leave the patch in "

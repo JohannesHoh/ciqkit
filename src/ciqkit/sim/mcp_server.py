@@ -34,13 +34,15 @@ Tools:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
-import traceback
+import threading
+import time
 
 from . import jobs
-from .client import BrokerNotRunning, Client, _abs
-from .protocol import DEFAULT_PLAYBACK_MS, ChunkKind, JobState, Priority
+from .client import BrokerError, BrokerNotRunning, Client
+from .protocol import DEFAULT_PLAYBACK_MS, Priority
 
 from .. import __version__
 
@@ -48,16 +50,12 @@ PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "ciqsim", "version": __version__}
 
 
+log = logging.getLogger(__name__)
+
+
 def _project(args: dict) -> str:
     """Validate and normalise the `project` argument shared by every tool."""
-    raw = args.get("project") or "."
-    d = os.path.abspath(os.path.expanduser(raw))
-    if not os.path.isdir(d):
-        raise ValueError(f"project directory does not exist: {d}")
-    if not os.path.isfile(os.path.join(d, "manifest.xml")):
-        raise ValueError(
-            f"{d} is not a Connect IQ project (no manifest.xml)")
-    return d
+    return jobs.project_dir(args.get("project"))
 
 
 def _device(args: dict, proj: str) -> str:
@@ -71,18 +69,13 @@ def _device(args: dict, proj: str) -> str:
 
 
 def _name_of(project_dir: str) -> str:
-    return os.path.basename(os.path.normpath(project_dir)) or "project"
+    return jobs.app_name(project_dir)
 
 DEVICE_DOC = ("simulator device id. Default: the first manifest.xml product "
               "installed in the SDK, else venu3.")
 
-_PRIO = {"urgent": Priority.URGENT, "high": Priority.HIGH,
-         "normal": Priority.NORMAL, "batch": Priority.BATCH}
-
-
 def _prio(args: dict) -> int:
-    return (_PRIO["urgent"] if args.get("urgent")
-            else _PRIO.get(args.get("priority", "normal"), Priority.NORMAL))
+    return jobs.priority(args.get("priority"), bool(args.get("urgent")))
 
 
 # ── tool schemas ──────────────────────────────────────────────────────────────
@@ -142,7 +135,7 @@ TOOLS = [
                                          "whenever you just rebuilt the .prg — the "
                                          "warm-cache would otherwise re-shoot the "
                                          "PREVIOUS build's screen (the stale-warm bug)."},
-                "priority": {"type": "string", "enum": list(_PRIO)},
+                "priority": {"type": "string", "enum": list(jobs.PRIORITIES)},
                 "urgent": {"type": "boolean", "description": "jump the queue (preempt a running batch)"},
             },
             "required": ["name"],
@@ -178,7 +171,7 @@ TOOLS = [
                             "description": "where to write the PNGs. Default: a "
                                            "private ciqkit directory."},
                 "native": {"type": "boolean", "default": False},
-                "priority": {"type": "string", "enum": list(_PRIO)},
+                "priority": {"type": "string", "enum": list(jobs.PRIORITIES)},
                 "urgent": {"type": "boolean"},
             },
         },
@@ -240,7 +233,7 @@ TOOLS = [
                 "seed": {"type": "object",
                          "description": "Constants.mc const overrides for the build, restored after",
                          "additionalProperties": {"type": "string"}},
-                "priority": {"type": "string", "enum": list(_PRIO)},
+                "priority": {"type": "string", "enum": list(jobs.PRIORITIES)},
                 "urgent": {"type": "boolean"},
             },
             "required": ["name"],
@@ -315,7 +308,7 @@ TOOLS = [
                                        "macOS only."},
                 "storage": {"type": "string",
                             "description": "fresh (default), keep, or a fixture dir"},
-                "priority": {"type": "string", "enum": list(_PRIO)},
+                "priority": {"type": "string", "enum": list(jobs.PRIORITIES)},
                 "urgent": {"type": "boolean"},
             },
             "required": ["to"],
@@ -347,7 +340,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"job_id": {"type": "string"},
-                           "priority": {"type": "string", "enum": list(_PRIO), "default": "urgent"}},
+                           "priority": {"type": "string", "enum": list(jobs.PRIORITIES), "default": "urgent"}},
             "required": ["job_id"],
         },
     },
@@ -374,8 +367,13 @@ def _call_tool(name: str, args: dict) -> str:
             if name == "ciqsim_bump":
                 return json.dumps(c.bump(
                     args["job_id"],
-                    _PRIO.get(args.get("priority", "urgent"), Priority.URGENT)))
+                    jobs.priority(args.get("priority") or "urgent")))
             return json.dumps(c.cancel(args["job_id"]))
+        except BrokerError as e:
+            # The broker's answer, not a tool failure: `no such job` is routine
+            # once retention has reaped a job. The agent reads the reply itself,
+            # `code` included.
+            return json.dumps(e.reply, indent=2 if name == "ciqsim_status" else None)
         except BrokerNotRunning:
             # A fact, not an error: there is no queue because nothing is
             # running. Any other socket failure is a real error and is left to
@@ -409,7 +407,7 @@ def _call_tool(name: str, args: dict) -> str:
             marker_timeout_s=args.get("marker_timeout_s"))
         job = jobs.make_job(app=_name_of(proj), device=device, priority=_prio(args),
                             label=f"shot {args['name']}", chunks=chunks)
-        r = c.submit_wait(job)
+        r = _submit_wait(c, job)
         return json.dumps(_result_summary(r), indent=2)
 
     if name == "ciqsim_shots":
@@ -428,7 +426,7 @@ def _call_tool(name: str, args: dict) -> str:
             force=bool(args.get("force")))
         job = jobs.make_job(app=_name_of(proj), device=device, priority=_prio(args),
                             label=f"record {args['name']}", chunks=chunks)
-        r = c.submit_wait(job)
+        r = _submit_wait(c, job)
         return json.dumps(_result_summary(r), indent=2)
 
     if name == "ciqsim_nav":
@@ -446,7 +444,7 @@ def _call_tool(name: str, args: dict) -> str:
             fit=args.get("fit"))
         job = jobs.make_job(app=_name_of(proj), device=device, priority=_prio(args),
                             label=f"nav {args['to']}", chunks=chunks)
-        r = c.submit_wait(job)
+        r = _submit_wait(c, job)
         return json.dumps(_nav_summary(r), indent=2)
 
     if name == "ciqsim_test":
@@ -456,7 +454,7 @@ def _call_tool(name: str, args: dict) -> str:
         job = jobs.make_job(app=_name_of(proj), device=device, priority=Priority.BATCH,
                             label=f"test {_name_of(proj)}",
                             chunks=jobs.test_chunks(project=proj, device=device, prg=prg))
-        r = c.submit_wait(job)
+        r = _submit_wait(c, job)
         return json.dumps(_result_summary(r), indent=2)
 
     raise ValueError(f"unknown tool {name}")
@@ -496,7 +494,7 @@ def _shots_tool(c, args: dict) -> dict:
     for sc in picked:
         st = storage or sc.storage
         if st and not storage and st not in ("fresh", "keep"):
-            st = _abs(proj, os.path.expanduser(st))
+            st = jobs.abs_path(proj, os.path.expanduser(st))
         chunks = jobs.screen_chunks(
             project=proj, device=device, name=sc.name, prg=args.get("prg"),
             anchor=sc.anchor or None, seed=sc.seed, steps=sc.steps, storage=st,
@@ -504,22 +502,27 @@ def _shots_tool(c, args: dict) -> dict:
         job = jobs.make_job(app=app, device=device, priority=prio,
                             label=f"shot {sc.name}", chunks=chunks)
         try:
-            r = c.submit_wait(job)
+            r = _submit_wait(c, job)
         except (RuntimeError, OSError) as exc:
             r = {"ok": False, "error": str(exc)}
         rows.append(screen_summary(sc.name, r))
     return {"ok": all(r["ok"] for r in rows), "screens": rows}
 
 
-def _result_summary(r: dict) -> dict:
+def _result_summary(r: dict, command: str = jobs.JOB) -> dict:
+    """The tool's answer to a finished WAIT; ``ok``/``error`` are
+    :func:`jobs.verdict`'s, everything else is formatting."""
     job = r.get("job", {})
-    # The job's own error, else the broker's answer to the WAIT itself. Reading
-    # only the former turned a wait timeout into {"ok": false, "error": null}:
-    # an agent read that as a failed job and resubmitted one still running.
-    out = {"ok": r.get("ok"), "job_id": job.get("id"),
-           "error": job.get("error") or r.get("error")}
-    if r.get("error") == "wait timeout" and job.get("state") not in (
-            JobState.DONE, JobState.FAILED, JobState.CANCELLED):
+    v = jobs.verdict(r, command)
+    # `error` is the job's own error, else the broker's answer to the WAIT
+    # itself. Reading only the former turned a wait timeout into
+    # {"ok": false, "error": null}: an agent read that as a failed job and
+    # resubmitted one still running. A finished job is not a passed one
+    # either: a test run with no verdict, or a nav that never reached its
+    # screen, is a DONE job whose step says ok=false -- and the top-level ok
+    # is what an agent reads first.
+    out = {"ok": v.ok, "job_id": job.get("id"), "error": v.reason}
+    if v.still_running:
         out["still_running"] = True
         out["state"] = job.get("state")
         out["note"] = ("the job is still running and will still write its "
@@ -527,34 +530,157 @@ def _result_summary(r: dict) -> dict:
                        "ciqsim_status, or cancel it with ciqsim_cancel.")
     for res in job.get("results", []):
         out.setdefault("steps", []).append({res.get("kind"): res.get("result")})
-        # A finished job is not a passed one: a test run with no verdict, or
-        # a nav that never reached its screen, is a DONE job whose step says
-        # ok=false. The top-level ok is what an agent reads first.
-        step = res.get("result")
-        if isinstance(step, dict) and step.get("ok") is False:
-            out["ok"] = False
     return out
 
 
 def _nav_summary(r: dict) -> dict:
-    """Like :func:`_result_summary`, but ``ok`` is the reach verdict.
+    """Like :func:`_result_summary`, but ``ok`` is the reach verdict: the job
+    completing only means the chunks ran; nav answers "did I reach that screen"."""
+    return _result_summary(r, jobs.NAV)
 
-    The job completing only means the chunks ran; nav exists to answer "did I
-    reach that screen" (mirrors the CLI's ``_nav_exit``).
+
+# ── in-flight tool calls ──────────────────────────────────────────────────────
+# Each tools/call runs on its own worker thread, so the stdio loop keeps reading
+# while a shot or test job waits minutes for the simulator: ping, tools/list and
+# notifications/cancelled are answered meanwhile. The owner's rule for a
+# cancelled call is that its broker job is cancelled too -- an agent that gave
+# up on a shot must not leave it queued in front of everyone else.
+
+# How long EOF waits for workers to see their cancelled job finish before the
+# process exits anyway (they are daemon threads; the broker job is already
+# cancelled by then, so nothing is left running on our behalf).
+EOF_GRACE_S = 10.0
+
+
+class _Cancelled(Exception):
+    """The client cancelled this tools/call; submit nothing more for it.
+
+    Not a RuntimeError/OSError on purpose: ``_shots_tool`` catches those per
+    screen, and a cancel must end the whole list, not just one screen."""
+
+
+class _Call:
+    """One in-flight tools/call and the broker jobs it submitted
+    (``ciqsim_shots`` submits several, one after another).
+
+    ``stopping``: its jobs are cancelled and it must submit no more (a client
+    cancel, or stdin EOF). ``cancelled``: the client cancelled it, so it gets
+    no response. EOF sets only the former -- a client that merely half-closed
+    stdin still reads the answers of calls that were already finishing.
     """
-    out = _result_summary(r)
-    for step in r.get("job", {}).get("results", []):
-        if step.get("kind") != ChunkKind.REACH:
-            continue
-        res = step.get("result") or {}
-        if res.get("anchor") is False:
-            out["ok"] = False
-            out["error"] = (f"ran the steps but the target screen "
-                            f"{res.get('screen')!r} did not show the expected text")
-        elif not res.get("ok"):
-            out["ok"] = False
-            out["error"] = res.get("error", "nav did not reach the screen")
-    return out
+    __slots__ = ("cancelled", "stopping", "job_ids")
+
+    def __init__(self):
+        self.cancelled = False
+        self.stopping = False
+        self.job_ids: list[str] = []
+
+
+_inflight: dict = {}                 # JSON-RPC request id -> _Call
+_inflight_lock = threading.Lock()    # guards _inflight and every _Call's fields
+_out_lock = threading.Lock()         # one writer at a time on the JSON-RPC stdout
+_tls = threading.local()             # .call: the _Call the current worker serves
+
+
+def _submit_wait(c, job) -> dict:
+    """``Client.submit_wait``, in two steps when serving a tracked tools/call so
+    the call learns its job id before the long wait and a cancel can reach it.
+
+    Outside a worker (a direct ``_call_tool``) it is plain ``submit_wait``.
+    A wait *timeout* is still not a cancellation: only a client's
+    notifications/cancelled, or stdin EOF, cancels the job.
+    """
+    call = getattr(_tls, "call", None)
+    if call is None:
+        return c.submit_wait(job)
+    with _inflight_lock:
+        if call.stopping:
+            raise _Cancelled()
+    jid = c.submit(job)
+    with _inflight_lock:
+        call.job_ids.append(jid)
+        late = call.stopping
+    if late:
+        # The cancel arrived while SUBMIT was on the wire, so it could not have
+        # seen this id: cancel it here rather than leave it queued.
+        _cancel_jobs([jid])
+        raise _Cancelled()
+    return c.wait(jid, jobs.wait_budget(job))
+
+
+def _cancel_jobs(job_ids) -> None:
+    """Best-effort broker CANCEL for each job. Never autospawns: a broker that
+    is gone has nothing left to cancel."""
+    if not job_ids:
+        return
+    try:
+        c = Client(autospawn=False)
+    except Exception:  # noqa: BLE001
+        log.warning("cannot reach the broker to cancel %s", job_ids, exc_info=True)
+        return
+    for jid in job_ids:
+        try:
+            c.cancel(jid)
+        except Exception:  # noqa: BLE001 -- one failed cancel must not skip the rest
+            log.warning("could not cancel job %s", jid, exc_info=True)
+
+
+def _run_call(rid, call: _Call, name, args: dict) -> None:
+    """Worker body for one tools/call."""
+    _tls.call = call
+    result = None
+    try:
+        text = _call_tool(name, args)
+        result = {"content": [{"type": "text", "text": text}]}
+    except _Cancelled:
+        pass
+    except Exception as e:  # noqa: BLE001
+        # The traceback goes to the log, not the model: it is noise to an
+        # agent and leaks local paths. The type name stays, because str() of
+        # a KeyError/TypeError from a bad argument is empty or a bare key.
+        log.exception("tool %s failed", name)
+        result = {"content": [{"type": "text",
+                               "text": f"ERROR: {type(e).__name__}: {e}"}],
+                  "isError": True}
+    finally:
+        _tls.call = None
+        with _inflight_lock:
+            if _inflight.get(rid) is call:
+                del _inflight[rid]
+            cancelled = call.cancelled
+    # MCP: a cancelled request gets no response at all.
+    if result is not None and not cancelled:
+        _respond(rid, result)
+
+
+def _cancel_request(rid):
+    """notifications/cancelled: mark the call and cancel its broker jobs. An
+    unknown or finished id is ignored, as the spec says (the race is normal)."""
+    with _inflight_lock:
+        call = _inflight.get(rid)
+        if call is None or call.cancelled:
+            return None
+        already = call.stopping
+        call.cancelled = call.stopping = True
+        job_ids = [] if already else list(call.job_ids)
+    if not job_ids:
+        return None   # not submitted yet: _submit_wait sees the flag
+    # Off the read loop: a CANCEL to a wedged broker must not stall pings.
+    t = threading.Thread(target=_cancel_jobs, args=(job_ids,),
+                         name="mcp-cancel", daemon=True)
+    t.start()
+    return t
+
+
+def _cancel_all() -> None:
+    """stdin EOF: the client is gone, so nobody is waiting for these jobs."""
+    with _inflight_lock:
+        job_ids = []
+        for call in _inflight.values():
+            if not call.stopping:    # an already-cancelled call's jobs were too
+                call.stopping = True
+                job_ids += call.job_ids
+    _cancel_jobs(job_ids)
 
 
 # ── JSON-RPC stdio loop ───────────────────────────────────────────────────────
@@ -564,11 +690,22 @@ def _respond(rid, result=None, error=None):
         msg["error"] = error
     else:
         msg["result"] = result
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(msg) + "\n"
+    # Workers answer concurrently with the read loop; two half-written lines
+    # would corrupt the newline framing for every message after them.
+    with _out_lock:
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            # The client closed its end (EOF, then a late worker answer): there
+            # is no one to tell, and a traceback from a worker thread helps no one.
+            log.debug("dropped response %r: stdout is closed", rid)
 
 
 def _handle(msg: dict):
+    """Handle one message. A tools/call is started on a worker thread, which
+    is returned (so is a cancel's); everything else is answered inline."""
     method = msg.get("method")
     rid = msg.get("id")
     if method == "initialize":
@@ -583,23 +720,47 @@ def _handle(msg: dict):
         params = msg.get("params", {})
         name = params.get("name")
         args = params.get("arguments", {}) or {}
-        try:
-            text = _call_tool(name, args)
-            _respond(rid, {"content": [{"type": "text", "text": text}]})
-        except Exception as e:  # noqa: BLE001
-            _respond(rid, {"content": [{"type": "text",
-                                        "text": f"ERROR: {e}\n{traceback.format_exc()}"}],
-                           "isError": True})
+        call = _Call()
+        with _inflight_lock:
+            _inflight[rid] = call
+        t = threading.Thread(target=_run_call, args=(rid, call, name, args),
+                             name=f"mcp-call-{rid}", daemon=True)
+        t.start()
+        return t
+    elif method == "notifications/cancelled":
+        return _cancel_request((msg.get("params") or {}).get("requestId"))
     elif method == "ping":
         _respond(rid, {})
     elif rid is not None:
         _respond(rid, error={"code": -32601, "message": f"method not found: {method}"})
+    return None
+
+
+def _setup_logging() -> None:
+    """Send ``log.exception`` somewhere: stderr, which MCP clients keep as the
+    server's log. Never stdout -- that is the JSON-RPC channel. brokerd.log is
+    the broker's, not ours."""
+    lvl = logging.getLevelName(os.environ.get("CIQKIT_LOG_LEVEL", "WARNING").upper())
+    logging.basicConfig(
+        level=lvl if isinstance(lvl, int) else logging.WARNING,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)-7s [ciqkit-mcp] %(name)s: %(message)s",
+    )
 
 
 def main():
     from .._compat import utf8_stdio
     utf8_stdio()
-    for line in sys.stdin:
+    _setup_logging()
+    serve(sys.stdin)
+
+
+def serve(lines, grace_s: float = EOF_GRACE_S) -> None:
+    """Read newline-delimited JSON-RPC from ``lines`` until EOF, then cancel
+    every in-flight call's broker job and give the workers ``grace_s`` to see
+    it before returning."""
+    workers: list[threading.Thread] = []
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -612,10 +773,21 @@ def main():
             print(f"[ciqkit-mcp] ignoring malformed line: {exc}", file=sys.stderr)
             continue
         try:
-            _handle(msg)
+            t = _handle(msg)
         except Exception:
+            log.exception("unhandled error handling message")
             if isinstance(msg, dict) and msg.get("id") is not None:
                 _respond(msg["id"], error={"code": -32603, "message": "internal error"})
+            continue
+        if t is not None:
+            workers = [w for w in workers if w.is_alive()]
+            workers.append(t)
+    # EOF: the client is gone. Cancel what it was waiting for -- nobody will
+    # read the results -- then let the workers wind down, bounded.
+    _cancel_all()
+    deadline = time.monotonic() + grace_s
+    for w in workers:
+        w.join(max(0.0, deadline - time.monotonic()))
 
 
 if __name__ == "__main__":

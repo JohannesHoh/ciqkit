@@ -136,6 +136,10 @@ _ntdll.NtQueryInformationProcess.restype = ctypes.c_long
 _ntdll.NtQueryInformationProcess.argtypes = (wt.HANDLE, ctypes.c_int, ctypes.c_void_p,
                                              wt.ULONG, ctypes.POINTER(wt.ULONG))
 kernel32.TerminateProcess.argtypes = (wt.HANDLE, wt.UINT)
+kernel32.GetProcessTimes.argtypes = (wt.HANDLE, ctypes.POINTER(wt.FILETIME),
+                                     ctypes.POINTER(wt.FILETIME),
+                                     ctypes.POINTER(wt.FILETIME),
+                                     ctypes.POINTER(wt.FILETIME))
 _ProcessCommandLineInformation = 60   # Windows 8.1+
 PROCESS_TERMINATE = 0x0001
 
@@ -181,6 +185,72 @@ def terminate(pid: int) -> bool:
         return bool(kernel32.TerminateProcess(h, 1))
     finally:
         kernel32.CloseHandle(h)
+
+
+def creation_time(pid: int) -> int | None:
+    """``pid``'s creation time (FILETIME ticks), or None if unreadable or gone."""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return None
+    try:
+        created, _exit, _kernel, _user = (wt.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(_exit),
+                                        ctypes.byref(_kernel), ctypes.byref(_user)):
+            return None
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def kill_tree(root: int, passes: int = 3) -> None:
+    """Terminate ``root`` and every process descended from it.
+
+    Windows has no process groups to signal, and TerminateProcess takes one
+    process: killing a build's bash/cmd.exe leaves monkeyc's java running and
+    holding the output pipes. The tree is read from Toolhelp parent links --
+    what ``taskkill /T`` does, without its localised output or a subprocess.
+
+    The caller must still hold a handle on ``root`` (a ``Popen`` does), so its
+    pid cannot have been reused. The links below it are not pinned: a parent
+    link is the creator's pid at creation and is never updated, so a dead
+    creator's pid may now belong to the build's own bash/java and a bystander
+    (the broker, the simulator) still names it as parent. A link is followed
+    only when the child was created no earlier than its parent
+    (:func:`_compat.tree_order`), and this process is never terminated.
+    Parents are terminated before their children so none can start another
+    while we work down, and the walk repeats because a child started between
+    the snapshot and the kill is only visible in the next one. A later pass
+    walks from every pid an earlier one found, so a straggler is still reached
+    through its (now dead) parent's pid -- using the creation time recorded
+    while that parent was alive; a root pid that is alive again with a
+    different creation time is a reused pid and is dropped.
+    """
+    from ._compat import tree_order
+
+    times: dict[int, int] = {}   # creation times read while the process lived
+
+    def born(pid: int) -> int | None:
+        t = creation_time(pid)
+        if t is not None:
+            times.setdefault(pid, t)
+            return t
+        return times.get(pid)
+
+    me = os.getpid()
+    doomed: list[int] = [int(root)]
+    born(int(root))
+    seen: set[int] = set()
+    for _ in range(passes):
+        doomed = [p for p in doomed
+                  if (t := creation_time(p)) is None or t == times.get(p)]
+        order = tree_order([(pid, ppid) for pid, ppid, _n in processes()], doomed, born)
+        fresh = [pid for pid in order if pid not in seen and pid != me]
+        if not fresh:
+            return
+        for pid in fresh:
+            terminate(pid)
+        seen.update(fresh)
+        doomed = order
 
 
 def session_id(pid: int | None = None) -> int | None:

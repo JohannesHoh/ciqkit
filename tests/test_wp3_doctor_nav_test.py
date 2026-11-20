@@ -264,14 +264,14 @@ def test_session_build_tests_uses_the_t_variant(env, proj, monkeypatch):
         (proj / "bin" / "MyApp-test.prg").write_text("p")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(sess.subprocess, "run", fake_run)
+    monkeypatch.setattr(sess._compat, "run_killing_tree", fake_run)
     out = sess.SimSession.__new__(sess.SimSession).build(str(proj), "venu3", tests=True)
     assert out.endswith(os.path.join("bin", "MyApp-test.prg")) and seen["argv"][-1] == "-t"
 
 
 def test_session_build_tests_refuses_a_custom_build_command(env, proj, monkeypatch):
     monkeypatch.setenv("CIQKIT_BUILD_CMD", "make {device}")
-    monkeypatch.setattr(sess.subprocess, "run",
+    monkeypatch.setattr(sess._compat, "run_killing_tree",
                         lambda *a, **k: pytest.fail("must not run a normal build"))
     with pytest.raises(sess.SimError, match="--prg"):
         sess.SimSession.__new__(sess.SimSession).build(str(proj), "venu3", tests=True)

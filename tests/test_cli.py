@@ -11,7 +11,7 @@ import pytest
 
 from ciqkit import cli
 from ciqkit.qa import icons
-from ciqkit.sim import client
+from ciqkit.sim import client, jobs
 
 
 def test_bare_invocation_lists_commands(capsys):
@@ -238,22 +238,26 @@ def _result(anchor):
                                              "result": {"anchor": anchor}}]}}
 
 
+def _shot_exit(r):
+    return jobs.verdict(r, jobs.SHOT).exit_code
+
+
 def test_a_matched_anchor_passes():
-    assert client._anchor_ok(_result(True)) is True
+    assert _shot_exit(_result(True)) == 0
 
 
 def test_a_missing_anchor_fails():
-    assert client._anchor_ok(_result(False)) is False
+    assert _shot_exit(_result(False)) == 3
 
 
 def test_an_unavailable_ocr_backend_does_not_fail_the_command():
     """`None` is "skipped", not "failed" -- otherwise every machine without an
     OCR backend would start failing captures that are perfectly fine."""
-    assert client._anchor_ok(_result(None)) is True
+    assert _shot_exit(_result(None)) == 0
 
 
 def test_a_run_with_no_shot_step_passes():
-    assert client._anchor_ok({"ok": True, "job": {"results": []}}) is True
+    assert _shot_exit({"ok": True, "job": {"results": []}}) == 0
 
 
 # --- seeding only means anything if a build follows --------------------------
@@ -373,12 +377,60 @@ def test_acting_on_a_job_the_broker_does_not_know_exits_nonzero(monkeypatch, cmd
     """Retention reaping makes this routine for anything older than 15 minutes.
     Exiting 0 while the JSON on stdout says the command failed is worse than
     the failure."""
-    reply = {"ok": False, "error": "no such job"}
-    monkeypatch.setattr(client.Client, "cancel", lambda self, job_id: reply)
-    monkeypatch.setattr(client.Client, "bump",
-                        lambda self, job_id, priority=0: reply)
+    # The broker's reply runs through the client's own check, which raises
+    # BrokerError on it; main() prints the reply and exits 1.
+    reply = {"ok": False, "error": "no such job", "code": "no_such_job"}
+    monkeypatch.setattr(client.Client, "_rpc", lambda self, req, read_timeout=None: reply)
     assert client.main(cmd) == 1
-    assert json.loads(capsys.readouterr().out)["error"] == "no such job"
+    assert json.loads(capsys.readouterr().out) == reply
+
+
+@pytest.mark.parametrize("cmd", [["cancel", "gone"], ["bump", "gone"], ["wait", "gone"]])
+def test_a_reply_from_an_older_broker_without_a_code_still_fails(monkeypatch, cmd,
+                                                                 capsys):
+    """A broker from before error codes says it in text alone."""
+    reply = {"ok": False, "error": "no such job"}
+    monkeypatch.setattr(client.Client, "_rpc", lambda self, req, read_timeout=None: reply)
+    with pytest.raises(client.BrokerError) as ei:
+        client.Client(autospawn=False).cancel("gone")
+    assert ei.value.code == "no_such_job" and ei.value.reply is reply
+    assert client.main(cmd) == 1
+    assert json.loads(capsys.readouterr().out) == reply
+
+
+def test_a_shutting_down_broker_is_waited_out_and_the_submit_retried(monkeypatch):
+    replies = iter([{"ok": False, "error": "broker is shutting down",
+                     "code": "shutting_down"}, {"ok": True, "job_id": "j2"}])
+    gone = []
+    monkeypatch.setattr(client.Client, "_rpc",
+                        lambda self, req, read_timeout=None: next(replies))
+    monkeypatch.setattr(client.Client, "wait_gone",
+                        lambda self, timeout_s=30.0: gone.append(1) or True)
+    job = jobs.make_job(app="a", device="venu3", chunks=jobs.op_chunks([]))
+    assert client.Client(autospawn=False).submit(job) == "j2"
+    assert gone == [1]
+
+
+@pytest.mark.parametrize("reply,code", [
+    ({"ok": False, "error": "invalid job: no chunks", "code": "invalid"}, "invalid"),
+    ({"ok": False, "error": "invalid job: no chunks"}, "invalid"),       # older broker
+    ({"ok": False, "error": "something new"}, "internal"),
+])
+def test_a_refused_submit_raises_a_typed_broker_error(monkeypatch, reply, code):
+    monkeypatch.setattr(client.Client, "_rpc", lambda self, req, read_timeout=None: reply)
+    job = jobs.make_job(app="a", device="venu3", chunks=jobs.op_chunks([]))
+    with pytest.raises(client.BrokerError) as ei:
+        client.Client(autospawn=False).submit(job)
+    assert ei.value.code == code and str(ei.value) == reply["error"]
+    assert isinstance(ei.value, RuntimeError)     # what `shots` catches per screen
+
+
+def test_a_wait_timeout_is_returned_not_raised(monkeypatch):
+    """Its reply carries the still-running job; the caller needs it."""
+    reply = {"ok": False, "error": "wait timeout", "code": "wait_timeout",
+             "job": {"id": "j1", "state": "running", "results": []}}
+    monkeypatch.setattr(client.Client, "_rpc", lambda self, req, read_timeout=None: reply)
+    assert client.Client(autospawn=False).wait("j1", 1) is reply
 
 
 def test_wait_that_times_out_again_still_says_the_job_is_running(monkeypatch,
@@ -570,3 +622,39 @@ def test_a_passing_test_run_exits_zero(project, monkeypatch):
                         lambda self, job, timeout_s=0: _test_result(
                             {"ok": True, "passed": 1, "failed": 0, "errors": 0, "ran": 1}))
     assert client.main(["test", "--project", str(project), "--prg", "t.prg"]) == 0
+
+
+def test_project_flag_expands_a_leading_tilde(tmp_path, monkeypatch):
+    import argparse
+    import os
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "manifest.xml").write_bytes(b"<iq:manifest/>")
+    ns = argparse.Namespace(project=os.path.join("~", "app"))
+    assert client._project_dir(ns) == os.path.abspath(str(app))
+    with pytest.raises(SystemExit, match="--project directory does not exist"):
+        client._project_dir(argparse.Namespace(project=os.path.join("~", "nope")))
+
+
+def test_a_cheap_op_gives_up_on_a_broker_that_never_answers(monkeypatch):
+    """status/ping/bump/cancel must not inherit WAIT's ten-minute read timeout."""
+    import socket as _socket
+    from ciqkit.sim import client as client_mod
+
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)  # accepts at the kernel level, never replies
+    try:
+        monkeypatch.setattr(client_mod, "CHEAP_RPC_TIMEOUT_S", 0.2)
+        c = client_mod.Client("unused", autospawn=False)
+        monkeypatch.setattr(
+            c, "_connect", lambda: _socket.create_connection(srv.getsockname(), timeout=5))
+        import time as _time
+        t0 = _time.monotonic()
+        with pytest.raises(OSError):  # socket.timeout is an OSError
+            c.status()
+        assert _time.monotonic() - t0 < 5
+    finally:
+        srv.close()

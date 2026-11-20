@@ -190,7 +190,7 @@ def test_build_refuses_when_only_a_stale_prg_was_named(tmp_path, monkeypatch):
     _prg(tmp_path, "Old.prg", time.time() - 3600)
 
     s = SimSession.__new__(SimSession)
-    monkeypatch.setattr(session_mod.subprocess, "run",
+    monkeypatch.setattr(session_mod._compat, "run_killing_tree",
                         lambda *a, **k: types.SimpleNamespace(
                             returncode=0, stdout="reusing Old.prg", stderr=""))
     with pytest.raises(SimError) as exc:

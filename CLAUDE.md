@@ -67,7 +67,9 @@ cli.py  ──►  sim/client.py ──sim/transport.py (JSON lines)──►  s
   Priority ages toward urgent (one whole tier per 45 s of **waiting**, never
   reaching urgent itself) so batch jobs cannot starve while a real urgent job
   still preempts them. Every session call the scheduler makes runs on a
-  bounded worker thread.
+  bounded worker thread: chunks by their `max_s`, and the zombie-reaping
+  `restart` and seed `restore` by `CIQSIM_ZOMBIE_GRACE_S` — one of those that
+  overruns stops the broker, like a wedged chunk worker.
   Holds the machine-wide `sim` lease while busy, so unmigrated scripts still
   serialise against it — and **fails the job** if it cannot take it, rather
   than driving a simulator someone else is already on. A daemon-singleton
@@ -90,6 +92,9 @@ cli.py  ──►  sim/client.py ──sim/transport.py (JSON lines)──►  s
   (no `AF_UNIX` in CPython) loopback TCP whose first line must carry a
   per-broker token from the private endpoint file. `CIQSIM_TRANSPORT=tcp`
   forces TCP on POSIX, which is how CI covers it there.
+* **`sdk.py`** — where the SDK and device profiles live (`detect_sdk`, `devices_root`). Stdlib-only
+  and outside `sim/` so `build.py` and `capture/` need not import `sim`; `sim/preflight.py` re-exports
+  it. `tests/test_layering.py` enforces the one-direction rule.
 * **`paths.py` / `leases.py`** — runtime dir is private and ownership-checked:
   per-uid 0700 on POSIX, `%LOCALAPPDATA%\ciqkit\runtime` with a protected
   user+SYSTEM ACL on Windows. Leases are OS file locks (kernel-released, so no

@@ -6,6 +6,7 @@ in-process against the JSON-RPC handler; the capture path is covered by
 `test_scheduler.py` and by driving a real simulator by hand.
 """
 import json
+import threading
 
 import pytest
 
@@ -18,7 +19,9 @@ def rpc(capsys):
     notification produced no output)."""
     def send(msg):
         capsys.readouterr()
-        mcp_server._handle(msg)
+        t = mcp_server._handle(msg)
+        if t is not None:      # a tools/call answers from its worker thread
+            t.join(30)
         out = capsys.readouterr().out.strip()
         return json.loads(out) if out else None
     return send
@@ -204,3 +207,290 @@ def test_record_wires_force_native_and_playback_into_the_job(
     assert chunks["load"]["force"] is True
     assert chunks["record"]["frame"] is False
     assert chunks["record"]["playback_ms"] == 250
+
+
+def test_a_failing_tool_call_returns_the_message_without_a_traceback(rpc, tmp_path):
+    is_err, text = _tool(rpc, "ciqsim_status", {})  # warm-up: protocol still answers
+    is_err, text = _tool(rpc, "ciqsim_shot", {"project": str(tmp_path / "missing")})
+    assert is_err
+    assert text.startswith("ERROR:") and "Traceback" not in text
+
+
+def test_bump_with_an_unknown_priority_is_an_error_not_urgent(rpc, monkeypatch):
+    from ciqkit.sim import client as sim_client
+
+    def boom(*a, **k):
+        raise AssertionError("must be refused before reaching the broker")
+    monkeypatch.setattr(sim_client.Client, "bump", boom)
+    is_err, text = _tool(rpc, "ciqsim_bump", {"job_id": "x", "priority": "bogus"})
+    assert is_err and "bogus" in text
+
+
+def test_a_tool_error_names_the_exception_type(rpc):
+    """str(KeyError('job_id')) is just "'job_id'": without the type an agent
+    cannot tell a missing argument from a broker answer."""
+    is_err, text = _tool(rpc, "ciqsim_bump", {})
+    assert is_err
+    assert text.startswith("ERROR: KeyError") and "job_id" in text
+
+
+
+@pytest.mark.parametrize("reply", [
+    {"ok": False, "error": "no such job", "code": "no_such_job"},
+    {"ok": False, "error": "no such job"},              # a broker from before codes
+])
+@pytest.mark.parametrize("tool", ["ciqsim_bump", "ciqsim_cancel"])
+def test_a_job_the_broker_does_not_know_is_its_answer_not_a_tool_error(
+        rpc, monkeypatch, tool, reply):
+    from ciqkit.sim import client as sim_client
+    monkeypatch.setattr(sim_client.Client, "_rpc",
+                        lambda self, req, read_timeout=None: reply)
+    is_err, text = _tool(rpc, tool, {"job_id": "gone"})
+    assert not is_err and json.loads(text) == reply
+
+
+def test_a_refused_submit_names_the_typed_error(rpc, monkeypatch, tmp_path):
+    from ciqkit.sim import client as sim_client
+    (tmp_path / "manifest.xml").write_bytes(b"<iq:manifest/>")
+    monkeypatch.setattr(sim_client.Client, "_rpc",
+                        lambda self, req, read_timeout=None: {
+                            "ok": False, "error": "invalid job: nope", "code": "invalid"})
+    is_err, text = _tool(rpc, "ciqsim_test", {"project": str(tmp_path),
+                                              "device": "venu3", "prg": "a.prg"})
+    assert is_err and text == "ERROR: BrokerError: invalid job: nope"
+
+# --- concurrency: a long tools/call must not block the read loop ------------
+# Every wait below is on an Event/Condition with a generous safety timeout; none
+# is a sleep that the test's outcome depends on.
+
+class _Out:
+    """Stand-in stdout: parses each JSON-RPC line and signals its id."""
+
+    def __init__(self):
+        self.buf = ""
+        self.msgs = []
+        self.lock = threading.Lock()
+        self.events = {}
+
+    def answered(self, rid):
+        with self.lock:
+            return self.events.setdefault(rid, threading.Event())
+
+    def write(self, s):
+        with self.lock:
+            self.buf += s
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                msg = json.loads(line)
+                self.msgs.append(msg)
+                self.events.setdefault(msg.get("id"), threading.Event()).set()
+
+    def flush(self):
+        pass
+
+    def ids(self):
+        with self.lock:
+            return [m.get("id") for m in self.msgs]
+
+
+class _FakeBroker:
+    """A broker whose WAIT blocks until released or the job is cancelled --
+    like the real one, which answers a WAIT as soon as the job is terminal."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.released = False
+        self.cancelled = []
+        self.submitted = threading.Event()
+        self.n = 0
+
+    def release(self):
+        with self.cond:
+            self.released = True
+            self.cond.notify_all()
+
+    def client_class(broker):
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def submit(self, job):
+                with broker.cond:
+                    broker.n += 1
+                    jid = f"job-{broker.n}"
+                broker.submitted.set()
+                return jid
+
+            def wait(self, jid, timeout_s=600.0):
+                with broker.cond:
+                    broker.cond.wait_for(
+                        lambda: broker.released or jid in broker.cancelled, 30)
+                    state = "cancelled" if jid in broker.cancelled else "done"
+                return {"ok": state == "done",
+                        "job": {"id": jid, "state": state, "results": []}}
+
+            def cancel(self, jid):
+                with broker.cond:
+                    broker.cancelled.append(jid)
+                    broker.cond.notify_all()
+                return {"ok": True}
+
+        return FakeClient
+
+
+@pytest.fixture
+def broker(monkeypatch):
+    b = _FakeBroker()
+    monkeypatch.setattr(mcp_server, "Client", b.client_class())
+    return b
+
+
+@pytest.fixture
+def out():
+    # Installed as sys.stdout by _serve, not here: pytest's own capture
+    # re-installs its stdout between fixture setup and the test body.
+    return _Out()
+
+
+@pytest.fixture
+def shot_call(tmp_path):
+    (tmp_path / "manifest.xml").write_text("<iq:manifest/>")
+    (tmp_path / "bin").mkdir()
+
+    def make(rid):
+        return json.dumps({
+            "jsonrpc": "2.0", "id": rid, "method": "tools/call",
+            "params": {"name": "ciqsim_shot", "arguments": {
+                "project": str(tmp_path), "name": "home",
+                "prg": "bin/App.prg", "device": "fenix7"}}})
+    return make
+
+
+def _ping(rid):
+    return json.dumps({"jsonrpc": "2.0", "id": rid, "method": "ping"})
+
+
+def _cancel(rid):
+    return json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": rid, "reason": "user aborted"}})
+
+
+def _serve(lines, out):
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mcp_server.sys, "stdout", out)
+        t = threading.Thread(target=mcp_server.serve, args=(lines,), daemon=True)
+        t.start()
+        t.join(60)
+    assert not t.is_alive(), "serve() did not return at EOF"
+    assert mcp_server._inflight == {}
+
+
+def test_a_ping_is_answered_while_a_tool_call_is_blocked(broker, out, shot_call):
+    seen = {}
+
+    def lines():
+        yield shot_call(1)
+        seen["submitted"] = broker.submitted.wait(10)
+        yield _ping(2)
+        seen["ping"] = out.answered(2).wait(10)
+        seen["call_still_blocked"] = not out.answered(1).is_set()
+        broker.release()
+        seen["call"] = out.answered(1).wait(10)
+
+    _serve(lines(), out)
+    assert seen == {"submitted": True, "ping": True,
+                    "call_still_blocked": True, "call": True}
+    assert out.ids() == [2, 1]
+    assert broker.cancelled == []     # a finished call cancels nothing at EOF
+
+
+def test_a_cancelled_call_cancels_its_job_and_gets_no_response(
+        broker, out, shot_call):
+    seen = {}
+
+    def lines():
+        yield shot_call(1)
+        seen["submitted"] = broker.submitted.wait(10)
+        yield _cancel(1)
+        with broker.cond:
+            seen["cancelled"] = broker.cond.wait_for(
+                lambda: "job-1" in broker.cancelled, 10)
+        yield _ping(2)
+        seen["ping"] = out.answered(2).wait(10)
+
+    _serve(lines(), out)
+    assert seen == {"submitted": True, "cancelled": True, "ping": True}
+    assert broker.cancelled == ["job-1"]
+    assert out.ids() == [2]           # MCP: no response to a cancelled request
+
+
+def test_eof_cancels_every_in_flight_job(broker, out, shot_call):
+    seen = {}
+
+    def lines():
+        yield shot_call(1)
+        seen["submitted"] = broker.submitted.wait(10)
+        # then EOF: the client went away mid-call
+
+    _serve(lines(), out)
+    assert seen == {"submitted": True}
+    assert broker.cancelled == ["job-1"]
+    # Not a client cancel: the answer is still written for a half-closed
+    # client, and it says the job did not finish.
+    assert out.ids() == [1]
+    text = out.msgs[0]["result"]["content"][0]["text"]
+    assert json.loads(text)["ok"] is False
+
+
+def test_a_call_finishing_after_eof_still_answers(out):
+    """EOF stops new jobs; it must not swallow an answer already on its way
+    (found by piping `ping; tools/call` into the real process)."""
+    _serve(iter([json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                             "params": {"name": "ciqsim_bump", "arguments": {}}})]),
+           out)
+    assert out.ids() == [3]
+
+
+def test_a_cancel_for_an_unknown_request_is_ignored(broker, out):
+    _serve(iter([_cancel(42), _ping(1)]), out)
+    assert out.ids() == [1] and broker.cancelled == []
+
+
+def test_concurrent_responses_never_interleave(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowOut:
+        def __init__(self):
+            self.n = 0
+            self.inside = False
+            self.overlap = False
+            self.lines = []
+
+        def write(self, s):
+            if self.inside:
+                self.overlap = True
+            self.inside = True
+            self.n += 1
+            if self.n == 1:          # park the first writer mid-write
+                entered.set()
+                release.wait(10)
+            self.lines.append(s)
+            self.inside = False
+
+        def flush(self):
+            pass
+
+    o = SlowOut()
+    monkeypatch.setattr(mcp_server.sys, "stdout", o)
+    a = threading.Thread(target=mcp_server._respond, args=(1, {}))
+    a.start()
+    assert entered.wait(10)
+    b = threading.Thread(target=mcp_server._respond, args=(2, {}))
+    b.start()
+    b.join(0.5)                      # give b every chance to barge in
+    assert b.is_alive(), "second response was written while the first was mid-write"
+    release.set()
+    a.join(10)
+    b.join(10)
+    assert not o.overlap
+    assert [json.loads(s)["id"] for s in o.lines] == [1, 2]

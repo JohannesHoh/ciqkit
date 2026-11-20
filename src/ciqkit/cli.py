@@ -36,7 +36,7 @@ _COMMANDS = {
     "layout": ("ciqkit.qa.layout", "checks"),
     "shot-score": ("ciqkit.qa.shot_score", "checks"),
     "icon": ("ciqkit.qa.icons", "checks"),
-    "storage": ("ciqkit.sim.storage", None),
+    "storage": ("ciqkit.sim.storage_cli", None),
     "lease": ("ciqkit.lease_cli", None),
     "keygen": ("ciqkit.keygen_cli", None),
     "new": ("ciqkit.new_cli", None),
