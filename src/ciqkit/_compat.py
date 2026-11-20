@@ -21,7 +21,7 @@ else:
 
 __all__ = ["IS_WIN", "pid_alive", "try_lock", "lock_blocking", "unlock",
            "open_lock_file", "detached_popen", "hidden_console_kwargs",
-           "kill_tree", "run_killing_tree", "tree_order"]
+           "kill_tree", "run_killing_tree", "tree_order", "which_no_cwd"]
 
 
 def pid_alive(pid) -> bool:
@@ -286,3 +286,33 @@ def run_killing_tree(argv, *, timeout: float, kill_grace_s: float = 2.0,
         except subprocess.TimeoutExpired:
             pass   # the root ignored SIGKILL/TerminateProcess; nothing more to do
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def _exe_names(name: str) -> list[str]:
+    if not IS_WIN:
+        return [name]
+    exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    if any(name.lower().endswith(e.lower()) for e in exts):
+        return [name]
+    return [name + e for e in exts]
+
+
+def which_no_cwd(name: str) -> str | None:
+    """``shutil.which(name)``, but never from the current directory.
+
+    On Windows ``shutil.which`` (always on 3.11; from 3.12 unless
+    ``NoDefaultCurrentDirectoryInExePath`` is set) looks in the current
+    directory before PATH, the way cmd.exe does -- so a ``git.exe`` or
+    ``java.exe`` in the checkout the user is standing in would be the one run.
+    This searches only the absolute PATH entries: a relative entry (``.``,
+    ``bin``) is the current directory by another name. An explicit setting
+    (``CIQKIT_BASH``, ``JAVA_HOME``) is the way to point at anything else.
+    """
+    for entry in (os.environ.get("PATH") or os.defpath).split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        for exe in _exe_names(name):
+            cand = os.path.join(entry, exe)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    return None

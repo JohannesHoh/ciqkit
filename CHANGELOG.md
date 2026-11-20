@@ -504,6 +504,14 @@ release, not by review:
 
 ### Security
 
+* The seed journal's backup blobs and journal are written durably (tmp + fsync +
+  replace, directory fsync) before the seed touches the tree, and recovery
+  refuses a blob whose hash differs from the recorded `original_sha256`: a
+  crash that left a truncated copy no longer overwrites the source file. The
+  entry is kept, with the blob path, in `ciqkit doctor` / `sim restore`.
+* FIT staging for the file panel uses a private (`0700`, owned, non-symlink) dir,
+  `0600` copies in a unique per-call subdirectory (same-name files no longer
+  overwrite each other), and removes copies over a day old.
 * The broker's control socket lives in a private per-user `0700` directory whose
   ownership and mode are verified before use, and the socket itself is created
   `0600`. It is a command channel — see [SECURITY.md](SECURITY.md).
@@ -523,7 +531,50 @@ release, not by review:
   originals are journalled to disk before any write, so a `kill -9` mid-seed is
   recoverable rather than merely detectable. Recovery is digest-guarded and
   will not overwrite a file that changed after ciqkit patched it.
+* Job fields from the wire or MCP are validated before anything runs: SHOT/RECORD
+  `name` must be a plain file stem and `out_dir` an absolute path (a `name` of
+  `../../x` wrote a PNG anywhere); `device` must be a device id (it was spliced
+  into the build command); nav `key`/`modifiers` are limited to one printable
+  non-quote character or a known key name; chunks per job, steps per recipe and
+  string lengths are capped; a NaN or negative WAIT `timeout_s` is refused.
+  Storage names `.` and `..` are refused, so `reset()` cannot remove the parent
+  MEDIA directory.
 * Process kills (`pkill`) are scoped to the caller's own uid, so a command-line
   pattern match cannot reach another user's process on a shared machine.
+* The broker interpreter is no longer looked for as a `.venv` in or above the
+  current directory: running `ciqkit sim` inside an untrusted checkout, or
+  anywhere under a `/tmp/.venv` another user planted, probed and then ran that
+  interpreter as the daemon. Candidates are now `CIQKIT_PYTHON`, the running
+  interpreter, its venv, and a `.venv` above ciqkit's own install only when it
+  is the user's and not group/world-writable. The cached choice is used only
+  while it is still a candidate.
+* The interpreter probe and the broker daemon run with `python -P` from the
+  private runtime directory, so a `json.py` or `numpy.py` in the caller's cwd
+  is no longer imported into the long-lived daemon.
+* git calls in a project or `.prg` checkout (storage journal sha/dirty, seed
+  dirty guard) go through `ciqkit.safegit`, which overrides `core.fsmonitor`,
+  `core.hooksPath`, every configured `filter.<driver>`, external diff/textconv
+  and lazy-fetch transports. A hostile `.git/config` in a same-owner tree no
+  longer runs code when ciqkit loads a `--prg` from it.
+* `git` (for Git Bash discovery) and `java` (monkeydo) are looked up only in
+  absolute `PATH` entries, never the current directory, and the broker runs
+  with `NoDefaultCurrentDirectoryInExePath=1` on Windows, so a `git.exe` or
+  `java.exe` planted in a checkout is not run.
+* TCP control channel (Windows): the 10 s auth limit is one deadline for the
+  whole token line, not a timeout per read, and an unauthenticated connection
+  no longer takes a handler slot — it waits in a 32-entry pre-auth pool that
+  evicts its oldest member. Before, any local account could drip one byte every
+  few seconds down 64 connections and lock the owner out of the broker.
+* TCP control channel: a token with non-ASCII characters is answered
+  `unauthorized` instead of raising `TypeError` in `hmac.compare_digest`
+  (a dropped connection and a traceback in `brokerd.log` per attempt).
+* Control channel: a request line over 1 MiB is refused and the connection
+  closed, read no further than the cap; before, a client could make the broker
+  buffer a line of any size.
+* TCP control channel: the client sends its token only if the broker that wrote
+  the endpoint file is still alive and (on Windows, from the TCP table) is the
+  process listening on that port. A hard-killed broker's leftover endpoint
+  could otherwise hand the token, and the jobs after it, to whichever local
+  account had bound the port since, free to answer with fabricated results.
 
 [0.1.0]: https://github.com/JohannesHoh/ciqkit/releases/tag/v0.1.0

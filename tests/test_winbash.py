@@ -45,7 +45,7 @@ def test_takes_the_bash_beside_git(tmp_path, monkeypatch, git_rel):
     root = os.path.join(os.path.realpath(tmp_path), "Git")
     git = _touch(root, *git_rel)
     bash = _touch(root, "bin", "bash.exe")
-    monkeypatch.setattr(winbash.shutil, "which", _which({"git": git}, []))
+    monkeypatch.setattr(winbash, "which_no_cwd", _which({"git": git}, []))
     assert winbash.git_bash() == bash
 
 
@@ -53,7 +53,7 @@ def test_falls_back_to_usr_bin_bash(tmp_path, monkeypatch):
     root = os.path.join(os.path.realpath(tmp_path), "Git")
     git = _touch(root, "cmd", "git.exe")
     bash = _touch(root, "usr", "bin", "bash.exe")
-    monkeypatch.setattr(winbash.shutil, "which", _which({"git": git}, []))
+    monkeypatch.setattr(winbash, "which_no_cwd", _which({"git": git}, []))
     assert winbash.git_bash() == bash
 
 
@@ -61,7 +61,7 @@ def test_never_asks_path_for_bash(tmp_path, monkeypatch):
     # The first bash.exe on a stock Windows 11 PATH is WSL's; it must not leak in.
     wsl = _touch(str(tmp_path), "System32", "bash.exe")
     asked = []
-    monkeypatch.setattr(winbash.shutil, "which", _which({"bash": wsl}, asked))
+    monkeypatch.setattr(winbash, "which_no_cwd", _which({"bash": wsl}, asked))
     assert winbash.git_bash() is None
     assert "bash" not in asked
 
@@ -72,13 +72,13 @@ def test_finds_git_not_on_path(tmp_path, monkeypatch, env, rel):
     base = str(tmp_path)
     bash = _touch(base, *rel, "bin", "bash.exe")
     monkeypatch.setenv(env, base)
-    monkeypatch.setattr(winbash.shutil, "which", _which({}, []))
+    monkeypatch.setattr(winbash, "which_no_cwd", _which({}, []))
     assert winbash.git_bash() == bash
 
 
 def test_result_is_cached_including_a_miss(monkeypatch):
     asked = []
-    monkeypatch.setattr(winbash.shutil, "which", _which({}, asked))
+    monkeypatch.setattr(winbash, "which_no_cwd", _which({}, asked))
     assert winbash.git_bash() is None
     assert winbash.git_bash() is None
     assert asked == ["git"]

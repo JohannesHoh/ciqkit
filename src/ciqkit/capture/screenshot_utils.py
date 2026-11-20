@@ -77,7 +77,7 @@ from .framing import (               # noqa: F401  -- re-exported API
     frame_device_art_capture, make_framed_screenshot, make_sdk_framed_screenshot,
 )
 from .fit_panel import (             # noqa: F401  -- re-exported API
-    FIT_STAGE_DIR, _BLE_MENU, _fit_osascript, read_fit_playback,
+    FIT_STAGE_DIR, FIT_STAGE_MAX_AGE_S, _BLE_MENU, _fit_osascript, read_fit_playback,
     read_phone_connection, set_phone_connection, stage_fit_for_panel,
     start_fit_playback,
 )

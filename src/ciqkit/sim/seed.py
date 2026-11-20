@@ -12,7 +12,7 @@ import os
 import re
 import subprocess
 
-from .. import _compat
+from .. import safegit
 from . import seedjournal
 from .errors import SimError
 
@@ -137,29 +137,31 @@ GIT_TIMEOUT_S = 10.0
 
 
 def _git_status(path: str) -> str:
-    """'clean' | 'dirty' | 'untracked' | 'no-git' | 'unknown' for one file.
+    """'clean' | 'dirty' | 'untracked' | 'no-git' | 'unknown' | 'unsafe' for one file.
 
-    'unknown' is git not answering within GIT_TIMEOUT_S.
+    'unknown' is git not answering within GIT_TIMEOUT_S; 'unsafe' is a repository
+    whose config safegit cannot neutralise, so git was not run at all.
     """
     d = os.path.dirname(path) or "."
-
-    def git(*args):
-        # run_killing_tree, not subprocess.run: Git for Windows' cmd\\git.exe
-        # hands its pipes to a child, and subprocess.run waits on them
-        # untimed after killing only the launcher.
-        return _compat.run_killing_tree(["git", *args], cwd=d, capture_output=True,
-                                        stdin=subprocess.DEVNULL, timeout=GIT_TIMEOUT_S)
+    # safegit: the repo's own config (core.fsmonitor, filters) must not run.
     try:
-        tracked = git("ls-files", "--error-unmatch", "--", path)
+        tracked = safegit.run(d, "ls-files", "--error-unmatch", "--", path,
+                              timeout=GIT_TIMEOUT_S)
         if tracked.returncode != 0:
-            inside = git("rev-parse", "--is-inside-work-tree")
+            inside = safegit.run(d, "rev-parse", "--is-inside-work-tree",
+                                 timeout=GIT_TIMEOUT_S)
             return "untracked" if inside.returncode == 0 else "no-git"
-        r = git("diff", "--quiet", "--", path)
+        r = safegit.run(d, "diff", "--quiet", "--", path, timeout=GIT_TIMEOUT_S)
         return "clean" if r.returncode == 0 else "dirty"
     except subprocess.TimeoutExpired:
         log.warning("git did not answer within %.0fs for %s", GIT_TIMEOUT_S, path)
         return "unknown"
-    except OSError:
+    except safegit.UnsafeRepo as e:
+        # git could only be asked by running the repo's own config; not asking
+        # is not the same as "clean".
+        log.warning("not asking git about %s: %s", path, e)
+        return "unsafe"
+    except (OSError, subprocess.SubprocessError):
         return "no-git"   # git is not installed; the journal still covers us
 
 
@@ -181,6 +183,12 @@ def _refuse_if_dirty(path: str, force: bool) -> None:
             f"git did not answer within {GIT_TIMEOUT_S:.0f}s, so ciqkit cannot "
             f"tell whether {path} has uncommitted changes. Check for a stuck "
             f"git (an index.lock), or pass force to seed anyway.")
+    if status == "unsafe":
+        raise SimError(
+            f"ciqkit will not run git in the repository holding {path}: its "
+            f"config (a partial clone on git before 2.44, or a filter driver "
+            f"whose name cannot be overridden) would run code from the repo. "
+            f"Commit or stash first and pass force to seed anyway.")
     if status == "dirty":
         raise SimError(
             f"{path} has uncommitted changes. Seeding rewrites it and restores "

@@ -71,7 +71,8 @@ def _device(args: dict, proj: str) -> str:
 def _name_of(project_dir: str) -> str:
     return jobs.app_name(project_dir)
 
-DEVICE_DOC = ("simulator device id. Default: the first manifest.xml product "
+DEVICE_DOC = ("simulator device id (letters, digits, _ and -; max 64). Default: the "
+              "first manifest.xml product "
               "installed in the SDK, else venu3.")
 
 def _prio(args: dict) -> int:
@@ -102,7 +103,8 @@ TOOLS = [
                 "project": {"type": "string",
                             "description": "Connect IQ project directory "
                                            "(contains manifest.xml). Default: cwd."},
-                "name": {"type": "string", "description": "output screenshot name"},
+                "name": {"type": "string", "pattern": "^[^/\\\\:]+$", "maxLength": 128,
+                         "description": "output screenshot name: a plain file name (no path separators)"},
                 "prg": {"type": "string",
                         "description": "already-built .prg, relative to the project "
                                        "dir. Omit to run the project's build script."},
@@ -193,7 +195,8 @@ TOOLS = [
             "properties": {
                 "project": {"type": "string",
                             "description": "Connect IQ project directory. Default: cwd."},
-                "name": {"type": "string", "description": "output clip name"},
+                "name": {"type": "string", "pattern": "^[^/\\\\:]+$", "maxLength": 128,
+                         "description": "output clip name: a plain file name (no path separators)"},
                 "prg": {"type": "string",
                         "description": "already-built .prg, relative to the project "
                                        "dir. Omit to run the project's build script."},

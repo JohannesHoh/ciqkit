@@ -7,6 +7,8 @@ still take effect here and there is no import cycle.
 """
 import os
 import shutil
+import tempfile
+import time
 
 from . import simwindows as _sw
 
@@ -97,6 +99,20 @@ def read_fit_playback() -> dict:
 #: Where FIT/GPX files are copied before the file panel loads them (see stage_fit_for_panel).
 FIT_STAGE_DIR = os.path.join(os.path.expanduser("~"), "Library", "Caches", "ciqkit", "fit")
 
+#: Staged copies older than this are removed on the next call; nothing else cleans them up.
+FIT_STAGE_MAX_AGE_S = 24 * 3600
+
+
+def _prune_fit_stage(stage_dir: str, now: float) -> None:
+    for name in os.listdir(stage_dir):
+        sub = os.path.join(stage_dir, name)
+        try:
+            if os.path.islink(sub) or now - os.lstat(sub).st_mtime < FIT_STAGE_MAX_AGE_S:
+                continue
+            shutil.rmtree(sub, ignore_errors=True)
+        except OSError:
+            pass   # best-effort housekeeping: a stale copy must not fail a load
+
 
 def stage_fit_for_panel(path: str, stage_dir: str = None) -> str:
     """The path to type into the file panel's Go-to-folder sheet for ``path``.
@@ -104,16 +120,26 @@ def stage_fit_for_panel(path: str, stage_dir: str = None) -> str:
     The panel will not open a file under the per-user temp dir (``/var/folders/..``,
     where ``tempfile``/``os.tmpdir()`` put files, either spelling): the sheet takes
     the path but the window stays empty (2026-11-12, SDK 9.1.0; a home or ``/tmp``
-    path loads). Such a file is copied to ``FIT_STAGE_DIR`` under its own name, and
-    that copy is loaded; any other path is returned unchanged.
+    path loads). Such a file is copied to ``FIT_STAGE_DIR`` and that copy is loaded;
+    any other path is returned unchanged.
+
+    The copy keeps its basename (the playback window shows it, and the caller
+    compares it) but sits in a fresh per-call subdirectory, so two files of the same
+    name never overwrite each other. The stage dir is private (0700, ours, not a
+    symlink -- it holds the user's activity data) and the copy is 0600; copies over
+    a day old are removed here since nothing else would.
     """
     real = os.path.realpath(path)
     if not (real.startswith("/private/var/folders/") or real.startswith("/var/folders/")):
         return path
-    stage_dir = stage_dir or FIT_STAGE_DIR
-    os.makedirs(stage_dir, exist_ok=True)
-    dst = os.path.join(stage_dir, os.path.basename(path))
-    shutil.copyfile(real, dst)
+    from ..paths import _ensure_private
+    stage_dir = _ensure_private(stage_dir or FIT_STAGE_DIR)
+    _prune_fit_stage(stage_dir, time.time())
+    sub = tempfile.mkdtemp(prefix="f-", dir=stage_dir)   # mkdtemp is created 0700
+    dst = os.path.join(sub, os.path.basename(path))
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as out, open(real, "rb") as src:
+        shutil.copyfileobj(src, out)
     return dst
 
 

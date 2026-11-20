@@ -49,7 +49,21 @@ granting full control to your account and SYSTEM only — nothing inherited, no
 other user, no Administrators group — and is re-checked (owner must be you) and
 re-tightened on every use, the Windows equivalent of `0700`. A connection that
 does not present the token within 10 seconds is answered `unauthorized` and
-closed before any request on it is parsed. Anyone who can read your private
+closed before any request on it is parsed; the 10 seconds are one deadline for
+the whole line, so trickling bytes does not extend it. Until it has presented
+the token a connection holds none of the broker's 64 handler slots: it waits
+in a pool of 32 that, when full, drops its *oldest* member, so connections
+parked by another local account cannot lock your client (which sends the token
+the moment it connects) out. An account racing to open connections faster
+than your client can send ~80 bytes could still delay it; that is a local
+denial of service, not access. Request lines are capped at 1 MiB. Before a
+client sends the token it checks that the broker which wrote
+`ciqsimd.endpoint` is still running and is the process listening on that port,
+so the file a hard-killed broker leaves behind does not hand the token — or
+your jobs — to whoever took the port since. The check identifies the broker
+by pid and port, so a process that is issued the dead broker's pid *and*
+holds its port still passes; delete a leftover `ciqsimd.endpoint` after a
+crash if that worries you. Anyone who can read your private
 profile directory can drive the broker — exactly as on POSIX, where anyone who
 can traverse your `0700` directory can.
 
@@ -68,7 +82,22 @@ from that project. Treat `ciqkit sim --project X` with exactly the same caution
 as `make` in an unfamiliar checkout: only run it against projects you trust.
 
 If you want to avoid this entirely, build the `.prg` yourself and always pass
-`--prg`; ciqkit then never executes anything from the project.
+`--prg`; ciqkit then never executes anything from the project or from the
+directory you run it in. In particular:
+
+* The broker is started with `python -P` from the private runtime directory,
+  so a `json.py` (or `numpy/`, `ciqkit/`) in the current directory is not
+  imported into it. Its interpreter is `CIQKIT_PYTHON`, the one running
+  ciqkit, or the venv ciqkit is installed in — never a `.venv` found in or
+  above the current directory. A `.venv` above ciqkit's own install is used
+  only if it is yours and not writable by anyone else.
+* git, which ciqkit asks for the sha and dirty state of the checkout a `.prg`
+  or a seeded file lives in, runs with the repository's executable settings
+  overridden (`core.fsmonitor`, `core.hooksPath`, every `filter.<driver>`,
+  external diff and textconv, lazy-fetch transports; a partial clone is not asked at all on git before 2.44, which ignores the switch that stops its lazy fetch). A repository whose
+  filter driver name cannot be overridden is not asked at all.
+* `git` and `java` are looked up only in the absolute entries of `PATH`, never
+  in the current directory (Windows otherwise searches it first).
 
 ### 3. The MCP server inherits both of the above
 

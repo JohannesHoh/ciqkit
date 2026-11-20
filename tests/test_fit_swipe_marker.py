@@ -4,6 +4,8 @@ All fixtures: AppleScript output and the app console are fed in as text/files,
 and the session's GUI calls are replaced, so no simulator, GUI or macOS is needed.
 """
 import os
+import sys
+import time
 
 import pytest
 
@@ -490,8 +492,42 @@ def test_stage_fit_for_panel_moves_temp_files_only(tmp_path):
         f.write(b"FITDATA")
     if os.path.realpath(f.name).startswith("/private/var/folders/"):
         out = su.stage_fit_for_panel(f.name, str(stage))
-        assert out == str(stage / os.path.basename(f.name))
+        assert os.path.basename(out) == os.path.basename(f.name)
+        assert os.path.dirname(os.path.dirname(out)) == str(stage)
         assert open(out, "rb").read() == b"FITDATA"
     os.unlink(f.name)
     home = os.path.expanduser("~/x.fit")
     assert su.stage_fit_for_panel(home, str(stage)) == home
+
+
+def _temp_fit(content):
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as f:
+        f.write(content)
+    return f.name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="/var/folders staging is macOS-only; POSIX mode bits")
+def test_stage_fit_private_unique_and_pruned(tmp_path):
+    a, b = _temp_fit(b"A"), _temp_fit(b"B")
+    if not os.path.realpath(a).startswith("/private/var/folders/"):
+        os.unlink(a), os.unlink(b)
+        pytest.skip("temp dir is not under /var/folders here")
+    stage = tmp_path / "stage"
+    try:
+        # the same file staged twice (same basename) must not collide
+        o1 = su.stage_fit_for_panel(a, str(stage))
+        o2 = su.stage_fit_for_panel(a, str(stage))
+        assert o1 != o2 and os.path.basename(o1) == os.path.basename(a)
+        assert open(o1, "rb").read() == b"A"
+        assert (os.stat(stage).st_mode & 0o777) == 0o700
+        assert (os.stat(os.path.dirname(o1)).st_mode & 0o777) == 0o700
+        assert (os.stat(o1).st_mode & 0o777) == 0o600
+        # stale copies go on the next call; fresh ones stay
+        old = os.path.dirname(o1)
+        t = time.time() - su.FIT_STAGE_MAX_AGE_S - 60
+        os.utime(old, (t, t))
+        o3 = su.stage_fit_for_panel(b, str(stage))
+        assert not os.path.exists(old) and os.path.exists(o2) and os.path.exists(o3)
+    finally:
+        os.unlink(a), os.unlink(b)

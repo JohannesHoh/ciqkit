@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -266,6 +268,83 @@ CHUNK_REQUIRED: dict[str, tuple] = {
 MAX_CHUNK_S = 3600.0
 
 
+# ── Wire-field limits ────────────────────────────────────────────────────────
+# Everything below is checked here, at the one validation point, so a hostile
+# or mistaken client is refused before any chunk runs.
+# Generous on purpose: the longest real recipe (a `shots --all` job or a nav
+# recipe) is a few dozen entries.
+MAX_CHUNKS = 64
+MAX_STEPS = 64
+MAX_STR_LEN = 4096          # any string that reaches the filesystem or a command
+MAX_NAME_LEN = 128
+# Real Garmin ids (venu3, fenix7pro, epix2pro47mm, approachs70_47mm). Never a
+# leading '-': the id is .format()ed into the build command and reaches monkeydo.
+# \Z, not $: `$` also matches before a trailing newline ("venu3\n").
+DEVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+# Keys a nav step may press. Names mirror the keycode map in
+# capture/screenshot_utils.phys_key (the owner); any other key is one printable
+# ASCII character that is not a quote or backslash (it is spliced into AppleScript).
+KEY_NAMES = ("up", "down", "left", "right", "return", "enter", "escape", "esc",
+             "space", "tab", "delete")
+MODIFIER_NAMES = ("command", "cmd", "shift", "option", "alt", "control", "ctrl")
+
+
+def name_error(where: str, v) -> str | None:
+    """Why ``v`` is not a plain file stem (it becomes ``<out_dir>/<v>.png``), or None.
+
+    Same rule as config.py's ``[[screens]]`` names, plus the characters that
+    make a Windows path leave its directory.
+    """
+    if not isinstance(v, str) or not v:
+        return f"{where}: name must be a non-empty string"
+    if (len(v) > MAX_NAME_LEN or v in (".", "..") or v != os.path.basename(v)
+            or any(c in v for c in "/\\:\0")):
+        return (f"{where}: name {v[:40]!r} must be a plain file name (no path "
+                f"separators, ':' or NUL, at most {MAX_NAME_LEN} characters)")
+    return None
+
+
+def out_dir_error(where: str, v) -> str | None:
+    """Why ``v`` is not an acceptable output directory, or None (unset is fine).
+
+    Any directory is allowed (the CLI takes the user's), but it must be
+    absolute: the broker's cwd is not the caller's. Front-ends resolve it
+    (jobs.abs_out_dir) before sending.
+    """
+    if v is None or v == "":
+        return None
+    if not isinstance(v, str) or "\0" in v or len(v) > MAX_STR_LEN or not os.path.isabs(v):
+        return f"{where}: out_dir must be an absolute path string"
+    return None
+
+
+def device_error(v) -> str | None:
+    """Why ``v`` is not a device id, or None (empty means "resolve it for me")."""
+    if not isinstance(v, str):
+        return "device must be a string"
+    if v and not DEVICE_RE.match(v):
+        return (f"device {v[:40]!r} must be a device id (letters, digits, '_' and "
+                f"'-', not starting with '-', at most 64 characters)")
+    return None
+
+
+def wait_timeout_error(v) -> str | None:
+    """Why a wire ``timeout_s`` is unusable, or None. NaN made WAIT spin forever."""
+    if (isinstance(v, bool) or not isinstance(v, (int, float))
+            or not math.isfinite(v) or v < 0):
+        return f"timeout_s={v!r} must be a finite number >= 0"
+    return None
+
+
+def _strings_error(where: str, d: dict) -> str | None:
+    """Over-long or NUL-carrying strings (also inside lists) in an args dict."""
+    for k, v in d.items():
+        for x in (v if isinstance(v, list) else [v]):
+            if isinstance(x, str) and (len(x) > MAX_STR_LEN or "\0" in x):
+                return f"{where}: {k} is too long or contains NUL"
+    return None
+
+
 def _budget_error(where: str, name: str, v: float) -> str | None:
     # json.loads accepts NaN and 1e400. A NaN max_s reached Thread.join() on
     # the scheduler thread, raised there, and took the whole broker -- and
@@ -383,6 +462,20 @@ def step_errors(step, where: str = "step") -> list[str]:
                     f"simulator.json: enter, esc, up, down, menu, ...)")
     if kind == "swipe":
         errs.extend(_swipe_errors(step, where))
+    if (e := _strings_error(where, step)) is not None:
+        errs.append(e)
+    if kind == "key" and step.get("key") is not None:
+        k = step["key"]
+        if not (isinstance(k, str) and (k.lower() in KEY_NAMES or (
+                len(k) == 1 and k.isascii() and k.isprintable() and k not in "\"'\\"))):
+            errs.append(f"{where}: key {str(k)[:20]!r} must be one printable character "
+                        f"(no quotes or backslash) or one of {', '.join(KEY_NAMES)}")
+    if kind == "key" and step.get("modifiers") is not None:
+        mods = step["modifiers"]
+        if not (isinstance(mods, list) and all(
+                isinstance(m, str) and m in MODIFIER_NAMES for m in mods)):
+            errs.append(f"{where}: modifiers must be a list of "
+                        f"{', '.join(MODIFIER_NAMES)}")
     if kind == "fit" and not (isinstance(step.get("path"), str) and step.get("path")):
         errs.append(f"{where}: kind 'fit' needs a path (the .fit/.gpx file to play back)")
     if kind == "shot_on":
@@ -390,6 +483,10 @@ def step_errors(step, where: str = "step") -> list[str]:
             errs.append(f"{where}: kind 'shot_on' needs a marker (console text to wait for)")
         if not (isinstance(step.get("name"), str) and step.get("name")):
             errs.append(f"{where}: kind 'shot_on' needs a name (the PNG's file name)")
+        elif (e := name_error(where, step["name"])) is not None:
+            errs.append(e)
+        if (e := out_dir_error(where, step.get("out_dir"))) is not None:
+            errs.append(e)
         t = step.get("timeout", 20)
         if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= 600:
             errs.append(f"{where}: shot_on timeout must be a number in (0, 600] seconds")
@@ -417,6 +514,10 @@ def validate_job(job: Job) -> list[str]:
         v = getattr(job, name)
         if not isinstance(v, str):
             errs.append(f"{name} must be a string, got {type(v).__name__}")
+    if isinstance(job.device, str) and (e := device_error(job.device)) is not None:
+        errs.append(e)
+    if len(job.chunks) > MAX_CHUNKS:
+        errs.append(f"job has {len(job.chunks)} chunks; at most {MAX_CHUNKS}")
     if not job.chunks:
         # Zero chunks is never runnable and never terminal: its WAIT hung to
         # the timeout and it kept the broker from ever idling out.
@@ -435,6 +536,18 @@ def validate_job(job: Job) -> list[str]:
         if not isinstance(c.args, dict):
             errs.append(f"{where}: args must be an object")
             continue
+        if (e := _strings_error(where, c.args)) is not None:
+            errs.append(e)
+        # The broker prefers args["device"] over job.device (load/test chunks
+        # carry one), and it reaches the build command's argv.
+        if "device" in c.args and (e := device_error(c.args["device"])) is not None:
+            errs.append(f"{where}: {e}")
+        if c.kind in (ChunkKind.SHOT, ChunkKind.RECORD):
+            # <out_dir>/<name>.png|gif: both halves decide where a file lands.
+            if (e := name_error(where, c.args.get("name"))) is not None:
+                errs.append(e)
+            if (e := out_dir_error(where, c.args.get("out_dir"))) is not None:
+                errs.append(e)
         for key in req:
             alts = key if isinstance(key, tuple) else (key,)
             # A non-empty STRING: every required arg is a path or a file name,
@@ -456,6 +569,8 @@ def validate_job(job: Job) -> list[str]:
             steps = c.args.get("steps") or []
             if not isinstance(steps, list):
                 errs.append(f"{where}: steps must be a list")
+            elif len(steps) > MAX_STEPS:
+                errs.append(f"{where}: {len(steps)} steps; at most {MAX_STEPS}")
             else:
                 for j, st in enumerate(steps):
                     errs.extend(step_errors(st, f"{where} step {j + 1}"))

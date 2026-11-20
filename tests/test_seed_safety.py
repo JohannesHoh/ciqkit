@@ -19,6 +19,7 @@ import subprocess
 
 import pytest
 
+from ciqkit import _compat, safegit
 from ciqkit.sim import seedjournal
 from ciqkit.sim.session import SimError, SimSession
 
@@ -151,7 +152,7 @@ def test_a_git_that_does_not_answer_is_bounded_and_refused(session, project, mon
     def hung(argv, **kw):
         seen.append(kw.get("timeout"))
         raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
-    monkeypatch.setattr(seed_mod._compat, "run_killing_tree", hung)
+    monkeypatch.setattr(_compat, "run_killing_tree", hung)
     with pytest.raises(SimError, match="did not answer"):
         session.seed(str(project), {"SEED_DEMO": "true"})
     assert seen and all(t == seed_mod.GIT_TIMEOUT_S for t in seen), seen
@@ -164,9 +165,26 @@ def test_a_git_timeout_reads_as_unknown(tmp_path, monkeypatch):
 
     def hung(argv, **kw):
         raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
-    monkeypatch.setattr(seed_mod._compat, "run_killing_tree", hung)
+    monkeypatch.setattr(_compat, "run_killing_tree", hung)
     assert seed_mod._git_status(str(tmp_path / "f.mc")) == "unknown"
 
+
+
+def test_a_repo_git_cannot_be_asked_safely_is_refused_not_read_as_clean(
+        session, project, monkeypatch):
+    """safegit raises UnsafeRepo for config it cannot neutralise (a partial
+    clone on old git, a filter name with "="). That used to fall through to
+    "no-git", i.e. clean, so the dirty guard let the seed through unasked."""
+    from ciqkit.sim import seed as seed_mod
+
+    def unsafe(*a, **kw):
+        raise safegit.UnsafeRepo("cannot be neutralised")
+    monkeypatch.setattr(seed_mod.safegit, "run", unsafe)
+    assert seed_mod._git_status(str(project / "source" / "Constants.mc")) == "unsafe"
+    with pytest.raises(SimError, match="will not run git"):
+        session.seed(str(project), {"SEED_DEMO": "true"})
+    assert "const SEED_DEMO = false;" in (project / "source" / "Constants.mc").read_text()
+    assert seed_mod._git_clean(str(project / "source" / "Constants.mc")) is False
 
 # ── the crash-safe journal ────────────────────────────────────────────────────
 
@@ -234,6 +252,38 @@ def test_recover_does_not_overwrite_a_file_edited_since_the_crash(session, proje
     assert entry["path"] == str(constants)
     with open(entry["backup"], "rb") as fh:
         assert fh.read() == b'const SEED_DEMO = false;\n'
+
+
+def test_recover_refuses_a_backup_that_fails_its_recorded_hash(session, project):
+    """A crash can leave a truncated blob; it must never overwrite the source."""
+    constants = project / "source" / "Constants.mc"
+    session.seed(str(project), {"SEED_DEMO": "true"})
+    patched = constants.read_bytes()
+    session._seed_backup = None
+    _orphan_the_journal()
+    [entry] = seedjournal.pending()["files"]
+    with open(entry["backup"], "wb") as fh:
+        fh.write(b"const SEED")                      # truncated blob
+
+    assert seedjournal.recover() == []
+    assert constants.read_bytes() == patched          # file left alone
+    [kept] = seedjournal.stale()                      # reported, with the blob path
+    assert kept["backup"] == entry["backup"]
+
+
+def test_recover_without_a_recorded_hash_still_restores(session, project):
+    """Journals from before original_sha256 existed keep the old behaviour."""
+    constants = project / "source" / "Constants.mc"
+    session.seed(str(project), {"SEED_DEMO": "true"})
+    session._seed_backup = None
+    journal = seedjournal.pending()
+    journal["pid"] = None
+    del journal["files"][0]["original_sha256"]
+    with open(seedjournal.journal_path(), "w") as fh:
+        json.dump(journal, fh)
+    # without original_sha256 the "already back" shortcut cannot fire; patched still matches
+    assert seedjournal.recover() == [str(constants)]
+    assert constants.read_text() == 'const SEED_DEMO = false;\n'
 
 
 def test_recover_is_quiet_when_the_file_is_already_back_to_normal(session, project):

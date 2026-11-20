@@ -63,7 +63,8 @@ import sys
 import tempfile
 import time
 
-from .._compat import IS_WIN, hidden_console_kwargs, lock_blocking, open_lock_file, unlock
+from .. import safegit
+from .._compat import IS_WIN, lock_blocking, open_lock_file, unlock
 
 __all__ = ["sim_apps_dir", "storage_name", "storage_files", "journal_root",
            "prg_uuid", "resolve_name", "learn_installed",
@@ -79,7 +80,8 @@ _STORAGE_LAYOUT = (("DATA", (".DAT", ".IDX", ".IMT")), ("SETTINGS", (".SET",)))
 _OBJSTORE = "DATA/MEDIA/OBJSTORE"   # + /<NAME>/... per app
 _REGISTRY = "installed.json"
 _ENTRY = "entry.json"
-_NAME_RE = re.compile(r"^[A-Z0-9_.-]+$")
+# Not all dots: "." / ".." made reset() rmtree the parent MEDIA dir.
+_NAME_RE = re.compile(r"^(?!\.+$)[A-Z0-9_.-]+$")
 
 
 # ── locations ───────────────────────────────────────────────────────────────
@@ -263,19 +265,14 @@ def _git_info(path: str | None) -> dict:
     if not path:
         return {}
     d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+    # safegit: d is wherever the --prg lives, possibly an untrusted checkout,
+    # and its .git/config (core.fsmonitor, filters) must not run (SECURITY.md §2).
     try:
-        top = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
-                             capture_output=True, encoding="utf-8", errors="replace",
-                             timeout=10, **hidden_console_kwargs())
+        top = safegit.run(d, "rev-parse", "--show-toplevel", timeout=10)
         if top.returncode != 0:
             return {}
-        sha = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
-                             capture_output=True, encoding="utf-8", errors="replace",
-                             timeout=10, **hidden_console_kwargs()).stdout.strip()
-        dirty = subprocess.run(["git", "-C", d, "status", "--porcelain",
-                                "--untracked-files=no"],
-                               capture_output=True, encoding="utf-8", errors="replace",
-                               timeout=20, **hidden_console_kwargs()).stdout.strip()
+        sha = safegit.run(d, "rev-parse", "HEAD", timeout=10).stdout.strip()
+        dirty = safegit.run(d, "status", "--porcelain", "--untracked-files=no").stdout.strip()
         return {"root": top.stdout.strip(), "sha": sha, "dirty": bool(dirty)}
     except Exception:
         return {}

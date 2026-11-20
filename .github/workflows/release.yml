@@ -11,10 +11,11 @@
 #  2. GitHub environment: Settings -> Environments -> New environment `pypi`.
 #     Optionally add required reviewers so a tag push waits for a human click.
 #  3. npm: create an automation (or granular, publish-scoped) access token for
-#     the `ciqkit-sdk-mcp` package and store it as the repository secret
-#     NPM_TOKEN. The package name must be free on npmjs.com. (npm trusted
-#     publishing via OIDC is an alternative once the package exists: configure
-#     it on npmjs.com, then drop NPM_TOKEN and the NODE_AUTH_TOKEN line.)
+#     the `ciqkit-sdk-mcp` package and store it as the secret NPM_TOKEN of a
+#     GitHub environment `npm` (not as a repository secret). The package name
+#     must be free on npmjs.com. (npm trusted publishing via OIDC is an
+#     alternative once the package exists: configure it on npmjs.com, then
+#     drop NPM_TOKEN and the NODE_AUTH_TOKEN line.)
 #  4. Versions: the Python version comes from src/ciqkit/__init__.py (hatch),
 #     the npm one from tools/sdk-mcp/package.json. Both must equal the tag
 #     without the leading `v`, or the job fails before publishing anything.
@@ -96,6 +97,10 @@ jobs:
     name: publish ciqkit-sdk-mcp to npm
     needs: ci
     runs-on: ubuntu-latest
+    # Same gate as the pypi job: keep NPM_TOKEN as a secret of this environment
+    # (not a repository secret), so only a job that names it can read the token,
+    # and required reviewers on it make a tag push wait for a human click.
+    environment: npm
     permissions:
       contents: read
       id-token: write   # npm provenance attestation

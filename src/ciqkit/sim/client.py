@@ -37,7 +37,7 @@ try:
 except ImportError:          # nothing to strip if leases cannot load here
     LEASE_ENV_KEY = "CIQKIT_LEASES_HELD"
 from . import transport
-from .._compat import (IS_WIN, detached_popen, hidden_console_kwargs,
+from .._compat import (IS_WIN, which_no_cwd, detached_popen, hidden_console_kwargs,
                        try_lock, unlock)
 from .protocol import DEFAULT_PLAYBACK_MS, Job, ChunkKind, Priority
 
@@ -117,6 +117,8 @@ class Client:
                 "    pip install \"ciqkit[sim]\"\n"
                 "  None of these interpreters could import them: "
                 f"{tried}\n"
+                "  (A .venv in the current directory is never tried: that would "
+                "run a checkout's own interpreter.)\n"
                 "  Point CIQKIT_PYTHON at one that can, run `ciqkit doctor` "
                 "for the full picture, or read the log at "
                 f"{os.path.join(proto.runtime_dir(), 'brokerd.log')}") from None
@@ -228,9 +230,28 @@ _BROKER_PROBE = (
 )
 
 
+def _python_argv(python: str, *args: str) -> list[str]:
+    """argv for running ciqkit code under ``python`` without the caller's cwd.
+
+    ``-c`` and ``-m`` put the current directory first on sys.path, so a
+    ``json.py`` or ``numpy.py`` in whatever checkout the user ran
+    ``ciqkit sim`` from would be imported into the probe and then into the
+    long-lived daemon. ``-P`` (3.11+, which ciqkit requires) drops that entry;
+    the caller also runs the child from the private runtime dir, so a relative
+    PYTHONPATH entry cannot reach back into the checkout either.
+
+    Not ``-I``: it implies ``-E`` and ``-s``, which drop PYTHONPATH and the user
+    site-packages -- exactly how an MCP shim or a ``pip install --user`` finds
+    ciqkit and its extras. Those come from the user's own environment, not
+    from the directory they happen to be in.
+    """
+    return [python, "-P", *args]
+
+
 def _can_run_broker(python: str) -> bool:
     try:
-        r = subprocess.run([python, "-c", _BROKER_PROBE],
+        r = subprocess.run(_python_argv(python, "-c", _BROKER_PROBE),
+                           cwd=proto.runtime_dir(),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            stdin=subprocess.DEVNULL, timeout=30,
                            **hidden_console_kwargs())
@@ -243,15 +264,58 @@ def _can_run_broker(python: str) -> bool:
 # on Windows.
 _VENV_PYTHON = ("Scripts", "python.exe") if IS_WIN else ("bin", "python")
 
+# Owners a venv directory may have besides the user: the admin-equivalents
+# (SYSTEM, Administrators, TrustedInstaller; root on POSIX), who could replace
+# the interpreter anyway.
+_WIN_TRUSTED_OWNERS = frozenset({
+    "S-1-5-18", "S-1-5-32-544",
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+})
+
+
+def _owned_safely(path: str, *, check_mode: bool = True) -> bool:
+    """``path`` belongs to us (or the admin) and nobody else can write it."""
+    try:
+        if IS_WIN:
+            from .. import _winapi
+            mine, owner = _winapi.owned_by_me(path)
+            return mine or owner in _WIN_TRUSTED_OWNERS
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if st.st_uid not in (os.getuid(), 0):
+        return False
+    return not (check_mode and st.st_mode & 0o022)
+
+
+def _trusted_venv_python(venv: str) -> str | None:
+    """The interpreter of ``venv`` if it is one only we could have put there.
+
+    A `.venv` found by walking up the directory tree can be anyone's: on a
+    shared machine ``/tmp/.venv`` (or ``C:\\.venv``, which any user may create)
+    sits above everything under it, and running it -- even as a probe -- is
+    running its owner's code as us. So the venv and its bin dir must be ours
+    and not group/world-writable, and the interpreter entry ours (it is
+    usually a symlink, whose own mode means nothing).
+    """
+    bindir = os.path.join(venv, _VENV_PYTHON[0])
+    cand = os.path.join(bindir, _VENV_PYTHON[1])
+    if not os.path.exists(cand):
+        return None
+    if not (_owned_safely(venv) and _owned_safely(bindir)
+            and _owned_safely(cand, check_mode=False)):
+        return None
+    return cand
+
 
 def _venvs_above(start: str):
-    """Yield the `.venv` interpreter for `start` and each parent."""
+    """Yield the trusted `.venv` interpreter for `start` and each parent."""
     d = os.path.abspath(start)
     seen = set()
     while d and d not in seen:
         seen.add(d)
-        cand = os.path.join(d, ".venv", *_VENV_PYTHON)
-        if os.path.exists(cand):
+        cand = _trusted_venv_python(os.path.join(d, ".venv"))
+        if cand:
             yield cand
         parent = os.path.dirname(d)
         if parent == d:
@@ -260,23 +324,41 @@ def _venvs_above(start: str):
 
 
 def broker_python_candidates() -> list[str]:
-    """Interpreters to try for the daemon, best first."""
+    """Interpreters to try for the daemon, best first.
+
+    Only interpreters the user chose or ciqkit is installed with. Not a
+    `.venv` in or above the current directory: that would run the
+    interpreter of whatever checkout the user is standing in (SECURITY.md
+    §2). A project whose venv should run the broker sets CIQKIT_PYTHON.
+    """
     out = []
 
     def add(p):
         if p and p not in out:
             out.append(p)
 
-    add(os.environ.get("CIQKIT_PYTHON"))
+    chosen = os.environ.get("CIQKIT_PYTHON")
+    # The probe and the daemon run from the runtime dir, not the caller's cwd,
+    # so a relative path like `.venv/bin/python` must be anchored here, where
+    # the user meant it. A bare name (`python3`) is a PATH lookup.
+    if chosen and os.path.dirname(chosen):
+        chosen = os.path.abspath(chosen)
+    elif chosen and IS_WIN:
+        # CreateProcess searches the caller's cwd before PATH for a bare name,
+        # whatever cwd= says; resolve it ourselves, PATH only (not found ->
+        # not a candidate, rather than a bare name CreateProcess would find
+        # in the cwd).
+        chosen = which_no_cwd(chosen)
+    add(chosen)
     add(sys.executable)
     # The venv ciqkit itself is installed into, when this module was imported
     # from one.
     add(os.path.join(sys.prefix, *_VENV_PYTHON))
-    # A .venv beside the caller's project or beside the ciqkit checkout — the
-    # editable-install layout every consumer of this package uses.
-    for start in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
-        for cand in _venvs_above(start):
-            add(cand)
+    # A .venv beside the ciqkit checkout this module was imported from -- the
+    # editable-install layout, when a base interpreter reaches that checkout
+    # over PYTHONPATH.
+    for cand in _venvs_above(os.path.dirname(os.path.abspath(__file__))):
+        add(cand)
     return out
 
 
@@ -288,18 +370,23 @@ def resolve_broker_python() -> str | None:
     """First candidate that can import the broker AND the sim extras.
 
     The winner is cached in the runtime dir so the probe (a subprocess import
-    per candidate) runs once per machine-boot rather than once per spawn.
+    per candidate) runs once per machine-boot rather than once per spawn. The
+    cache only saves the probe, it is not a trust anchor: a cached path is
+    used only while it is still one of :func:`broker_python_candidates`, so it
+    cannot carry a choice the current rules refuse (older releases cached a
+    `.venv` found above the caller's cwd).
     """
+    cands = broker_python_candidates()
     cache = _cached_broker_python_path()
     try:
         with open(cache) as f:
             cached = f.read().strip()
-        if cached and os.path.exists(cached) and _can_run_broker(cached):
+        if cached in cands and os.path.exists(cached) and _can_run_broker(cached):
             return cached
     except OSError:
         pass
 
-    for cand in broker_python_candidates():
+    for cand in cands:
         if _can_run_broker(cand):
             try:
                 with open(cache, "w") as f:
@@ -310,11 +397,16 @@ def resolve_broker_python() -> str | None:
     return None
 
 
+_DAEMON_PATH_VARS = ("CIQKIT_DEV_KEY", "CIQ_HOME", "CIQKIT_BASH")
+
+
 def spawn_daemon(sock_path: str | None = None):
     """Start the broker in the background. Idempotent: a second daemon sees the
     live socket and exits immediately."""
-    sock_path = sock_path or proto.socket_path()
-    log_path = os.path.join(proto.runtime_dir(), "brokerd.log")
+    # Absolute: the daemon does not run in the caller's cwd (see below).
+    sock_path = os.path.abspath(sock_path or proto.socket_path())
+    rundir = proto.runtime_dir()
+    log_path = os.path.join(rundir, "brokerd.log")
     env = dict(os.environ, CIQSIM_SOCK=sock_path)
     # The daemon outlives whoever spawned it. If that caller was running under
     # `ciqkit lease sim -- ...`, the inherited "already held" marker would make
@@ -322,6 +414,17 @@ def spawn_daemon(sock_path: str | None = None):
     # whole life -- long after the real holder exited -- and an unmigrated
     # script could then drive the simulator alongside it.
     env.pop(LEASE_ENV_KEY, None)
+    # Path-valued settings the daemon reads itself: it runs from the runtime
+    # dir, so a relative value must be anchored at the caller's cwd, where the
+    # user meant it (and where `ciqkit doctor` checks it).
+    for var in _DAEMON_PATH_VARS:
+        val = env.get(var)
+        if val and not os.path.isabs(os.path.expanduser(val)):
+            env[var] = os.path.abspath(os.path.expanduser(val))
+    if IS_WIN:
+        # CreateProcess (and shutil.which from 3.12) otherwise look for a bare
+        # "git" / "java" / "powershell" in the current directory before PATH.
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"
     python = resolve_broker_python()
     logf = open(log_path, "a")
     if python is None:
@@ -335,7 +438,11 @@ def spawn_daemon(sock_path: str | None = None):
     # Windows that means a hidden console of its own, so the daemon survives
     # the terminal that started it and its builds and pushes do not flash
     # console windows over the simulator mid-capture.
-    detached_popen([python, "-m", "ciqkit.sim.broker"], env=env,
+    # cwd is the private runtime dir, never the caller's: the daemon outlives
+    # the command that started it, and from the caller's checkout it would
+    # import that checkout's modules (see _python_argv) and, on Windows, run a
+    # git.exe / java.exe planted there.
+    detached_popen(_python_argv(python, "-m", "ciqkit.sim.broker"), env=env, cwd=rundir,
                    stdout=logf, stderr=logf, stdin=subprocess.DEVNULL)
 
 

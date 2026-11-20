@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 
-from ._compat import hidden_console_kwargs
+from ._compat import hidden_console_kwargs, which_no_cwd
 
 __all__ = ["git_bash", "to_windows_path"]
 
@@ -26,7 +25,9 @@ _cache: dict = {}
 
 
 def _git_roots():
-    git = shutil.which("git")
+    # Never a git.exe in the current directory: its <root>\bin\bash.exe would
+    # then run every build (see which_no_cwd).
+    git = which_no_cwd("git")
     if git:
         # <root>\cmd\git.exe, <root>\bin\git.exe or <root>\mingw64\bin\git.exe
         d = os.path.dirname(os.path.realpath(git))
