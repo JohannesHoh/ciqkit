@@ -976,8 +976,13 @@ class Broker:
         if op in (Op.WAIT, Op.BUMP, Op.CANCEL) and not isinstance(req.get("job_id"), str):
             return _bad(f"{op} needs a string job_id")
         if op == Op.PING:
+            # install/version let a client notice it is talking to a broker
+            # started from another checkout (see `ciqkit doctor`).
+            import ciqkit
             return {"ok": True, "pid": os.getpid(),
-                    "uptime_s": time.time() - _START}
+                    "uptime_s": time.time() - _START,
+                    "version": ciqkit.__version__,
+                    "install": os.path.dirname(os.path.abspath(ciqkit.__file__))}
         if op == Op.SUBMIT:
             if not isinstance(req.get("job"), dict):
                 return _bad("submit needs a job object")
@@ -1380,7 +1385,11 @@ def _handle_conn(broker: Broker, conn: socket.socket,
                 # must not hold a handler slot for an hour.
                 conn.settimeout(10)
                 if not listener.authenticate(f):
-                    log.warning("refused a connection that did not authenticate")
+                    # Logs how it failed: a peer that connected and sent
+                    # nothing (a port probe, a client that gave up) is not
+                    # the same as one holding a wrong token.
+                    log.warning("refused a connection that did not authenticate (%s)",
+                                "no auth line" if listener.last_auth_empty else "bad token")
                     f.close()
                     _refuse(conn, proto.error_reply(proto.E_UNAUTHORIZED, "unauthorized"))
                     return

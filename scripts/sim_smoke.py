@@ -63,6 +63,28 @@ def skip_reason(op: str, plat: str) -> str | None:
     return None
 
 
+def _head_sha() -> str:
+    """HEAD read by hand, for a worktree git cannot read (one made from WSL)."""
+    try:
+        git = os.path.join(ROOT, ".git")
+        with open(os.path.join(git, "HEAD"), encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref:"):
+            with open(os.path.join(git, *head[4:].strip().split("/")), encoding="utf-8") as fh:
+                head = fh.read().strip()
+        return head[:7] if len(head) >= 7 else ""
+    except OSError:
+        return ""
+
+
+def _fallback_version() -> str:
+    try:
+        from ciqkit import __version__
+        return f"v{__version__}"
+    except ImportError:
+        return "unknown"
+
+
 def _git_sha() -> str:
     try:
         sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
@@ -70,7 +92,7 @@ def _git_sha() -> str:
         dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
                                capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
-        return "unknown"
+        return _head_sha() or _fallback_version()
     # A run from a dirty tree did not test exactly that commit; say so.
     return sha + ("+dirty" if dirty else "")
 

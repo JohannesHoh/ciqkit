@@ -132,6 +132,7 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
 _DETACHED_PROCESS = 0x00000008
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_CREATE_SUSPENDED = 0x00000004
 
 
 def hidden_console_kwargs() -> dict:
@@ -208,26 +209,96 @@ def tree_order(procs, roots, born) -> list[int]:
     return order
 
 
-def kill_tree(proc: subprocess.Popen) -> None:
+def _win():
+    """The Win32 layer, or None on POSIX. A seam: tests pass a fake instead."""
+    if not IS_WIN:
+        return None
+    from . import _winapi
+    return _winapi
+
+
+def kill_tree(proc: subprocess.Popen, job: int | None = None) -> None:
     """Kill ``proc`` and everything it started. Best effort, never raises.
 
     POSIX: its process group, which :func:`run_killing_tree` made it the
     leader of (a descendant that calls ``setsid`` itself escapes; monkeyc's
-    java and monkeydo's shell do not). Windows: the parent-link tree.
+    java and monkeydo's shell do not). Windows: ``job``, the job object
+    :func:`run_killing_tree` put it in, else the parent-link tree.
     """
+    _kill_tree(proc, job, _win())
+
+
+def _kill_tree(proc, job, w) -> None:
     try:
-        if IS_WIN:
-            from . import _winapi
-            _winapi.kill_tree(proc.pid)
-        else:
+        if w is None:
             import signal
             os.killpg(proc.pid, signal.SIGKILL)
+        elif job is None or not w.terminate_job(job):
+            # No job, or it would not terminate: the parent-link walk, which
+            # misses a descendant whose parent already exited but is all
+            # there is without one.
+            w.kill_tree(proc.pid)
     except OSError:
         pass   # already gone (ProcessLookupError) or never ours
     try:
         proc.kill()   # the root at least, whatever the tree walk managed
     except OSError:
         pass
+
+
+def _popen_in_job(argv, kwargs: dict, w, popen=subprocess.Popen):
+    """Windows: start ``argv`` inside a new kill-on-close job. ``(proc, job)``.
+
+    The child is created suspended and resumed only once it is in the job, so
+    nothing it spawns can be born outside it -- assigning a running child
+    would leave a window in which a fast grandchild escapes. ``job`` is None
+    when no job could be made or the child could not be assigned (e.g. an
+    enclosing job on a Windows too old to nest them); the child then runs
+    anyway and :func:`_kill_tree` falls back to the parent-link walk. A child
+    that cannot be resumed is killed, never left frozen until the timeout
+    would report it as a hung build.
+    """
+    job = w.create_kill_job()
+    if job is None:
+        return popen(argv, **kwargs), None
+    flags = kwargs.get("creationflags", 0) | _CREATE_SUSPENDED
+    try:
+        proc = popen(argv, **{**kwargs, "creationflags": flags})
+    except BaseException:
+        w.close_handle(job)
+        raise
+    ok = False
+    try:
+        if not w.assign_to_job(job, proc.pid):
+            w.close_handle(job)
+            job = None
+        if not w.resume_process(proc.pid):
+            raise OSError(f"could not resume {argv!r} after starting it suspended")
+        ok = True
+    finally:
+        if not ok:   # a failed resume, or Ctrl-C between Popen and resume
+            _kill_tree(proc, job, w)
+            if job is not None:
+                w.close_handle(job)
+            for f in (proc.stdin, proc.stdout, proc.stderr):
+                if f:
+                    f.close()   # nothing reads them yet, so this cannot block
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    return proc, job
+
+
+def _close_job(job, w, finished: bool) -> None:
+    """Close the job handle. A run that ended on its own disarms it first, so
+    a background process it left (pipes already closed) is not killed --
+    what POSIX does, which never signals the group after a normal exit."""
+    if job is None:
+        return
+    if finished:
+        w.disarm_job(job)   # if this fails, the close kills the leftovers; acceptable
+    w.close_handle(job)
 
 
 def run_killing_tree(argv, *, timeout: float, kill_grace_s: float = 2.0,
@@ -241,8 +312,11 @@ def run_killing_tree(argv, *, timeout: float, kill_grace_s: float = 2.0,
     after the broker had given up on the chunk. On POSIX it returns, but leaves
     that java building in the background, beside the next job's build.
 
-    Here the child leads its own process group / session, a timeout (or any
-    exception, Ctrl-C included) kills the whole tree, and the output is then
+    Here the child leads its own process group / session -- on Windows it also
+    runs in its own job object (:func:`_popen_in_job`), because a parent-link
+    walk cannot reach a grandchild whose parent already exited, which is what
+    a venv's launcher ``python.exe`` or an early-exiting ``cmd /c`` leaves --
+    a timeout (or any exception, Ctrl-C included) kills the whole tree, and the output is then
     collected with a bounded ``communicate``. The result and the exception are
     the shapes ``subprocess.run`` gives: a ``CompletedProcess``, or
     ``TimeoutExpired`` carrying whatever output arrived (decoded, when text
@@ -254,15 +328,20 @@ def run_killing_tree(argv, *, timeout: float, kill_grace_s: float = 2.0,
     """
     if kwargs.pop("capture_output", False):
         kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
-    if IS_WIN:
+    w = _win()
+    job = None
+    if w is not None:
         kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NEW_PROCESS_GROUP
+        proc, job = _popen_in_job(argv, kwargs, w)
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(argv, **kwargs)
+        proc = subprocess.Popen(argv, **kwargs)
+    finished = False
     try:
         out, err = proc.communicate(timeout=timeout)
+        finished = True
     except subprocess.TimeoutExpired as exc:
-        kill_tree(proc)
+        _kill_tree(proc, job, w)
         try:
             exc.stdout, exc.stderr = proc.communicate(timeout=kill_grace_s)
         except subprocess.TimeoutExpired:
@@ -278,11 +357,12 @@ def run_killing_tree(argv, *, timeout: float, kill_grace_s: float = 2.0,
                         f.close()
         raise
     except BaseException:
-        kill_tree(proc)
+        _kill_tree(proc, job, w)
         raise
     finally:
         try:
             proc.wait(timeout=kill_grace_s)
         except subprocess.TimeoutExpired:
             pass   # the root ignored SIGKILL/TerminateProcess; nothing more to do
+        _close_job(job, w, finished)
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)

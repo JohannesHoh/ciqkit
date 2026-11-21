@@ -473,7 +473,7 @@ class Op:
     STATUS = "status"      # {op}                            -> {ok, jobs:[...], current}
     BUMP = "bump"          # {op, job_id, priority}          -> {ok}
     CANCEL = "cancel"      # {op, job_id}                    -> {ok}
-    PING = "ping"          # {op}                            -> {ok, pid, uptime_s}
+    PING = "ping"          # {op}                            -> {ok, pid, uptime_s, version, install}
     SHUTDOWN = "shutdown"  # {op}                            -> {ok}  (admin/tests)
 
 

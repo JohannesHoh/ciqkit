@@ -822,16 +822,75 @@ class SimSession:
     def _press_button(self, button, hold, delay):
         key = self._resolve_button(button)
         img = self._capture()
-        found = su.sim_button_point(img, self._device_id(), button,
-                                    scale=getattr(self._canvas, "retina_scale", None))
+        scale = self._art_scale_hint()
+        found = su.sim_button_point(img, self._device_id(), button, scale=scale)
         if found is None:
+            where = self._dump_alignment(img, button, scale)
             raise SimError(f"could not align the capture with {self._device_id()}'s "
                            f"device art to aim at button {button!r} (is the "
-                           f"simulator showing the device art, at its normal size?)")
+                           f"simulator showing the device art, at its normal size?)"
+                           + (f"; alignment data in {where}" if where else ""))
         x, y, _ = found
+        W, H = img.size
+        if not (0 <= x < W and 0 <= y < H):
+            # Aligned, but the key is in the part of the art the window cuts
+            # off (the Windows panel loses the strap end): a click there would
+            # land outside the simulator.
+            raise SimError(f"button {button!r} of {self._device_id()} is outside "
+                           f"the visible simulator panel (at {x:.0f},{y:.0f} of a "
+                           f"{W}x{H} capture); make the simulator window taller")
         held = key["hold"] if hold is None else bool(hold)
         su.pm_press_point(self._canvas, x, y,
                           hold_s=self.HOLD_S if held else 0.0, delay=delay)
+
+    def _art_scale_hint(self):
+        """Capture pixels per device-image pixel, as a hint for aiming at the
+        device art's buttons.
+
+        Not ``retina_scale`` on Windows. There the image is the DPI-unaware
+        simulator's own drawing, which holds the device PNG 1:1, while
+        ``retina_scale`` relates that image to PHYSICAL pixels (0.5 at
+        200 %). Passing it made the aligner try only a half-size silhouette,
+        which never matched ("could not align" on venu3, W2). On macOS the
+        two coincide: the PNG is drawn 1:1 in points, so at the Retina scale.
+        """
+        if su.IS_WIN:
+            return 1.0
+        return getattr(self._canvas, "retina_scale", None)
+
+    def _dump_alignment(self, img, button, scale):
+        """Save what the failed button alignment looked at and log it at
+        WARNING; returns the directory, or None. Best-effort: the SimError
+        the caller raises matters more than the diagnostics."""
+        c = self._canvas
+        geom = {k: getattr(c, k, None) for k in (
+            "retina_scale", "content_left", "content_top", "content_w",
+            "content_h", "display_box")}
+        try:
+            od = os.path.join(self.out_dir, "button-align",
+                              time.strftime("%Y%m%d-%H%M%S") + f"-{button}")
+            info = su.explain_device_alignment(img, self._device_id(), od,
+                                               scale=scale)
+        except Exception:
+            log.warning("button %r: alignment failed (scale hint %s, geometry %s) "
+                        "and its diagnostics could not be written", button, scale,
+                        geom, exc_info=True)
+            return None
+        try:
+            import json
+            with open(os.path.join(od, "geometry.json"), "w", encoding="utf-8") as fh:
+                json.dump({"platform": "windows" if su.IS_WIN else
+                           "mac" if su.IS_MAC else "other",
+                           "button": button, **geom}, fh, indent=2, default=str)
+        except (OSError, TypeError, ValueError):
+            pass
+        log.warning("button %r on %s: could not align the capture with the device "
+                    "art. scale hint %s, geometry %s, capture %s, capture dark bbox %s, "
+                    "device dark bbox %s, tried %s, best %s. Files: %s",
+                    button, self._device_id(), scale, geom, info.get("capture_size"),
+                    info.get("capture_dark_bbox"), info.get("device_dark_bbox"),
+                    info.get("tried"), info.get("best"), info.get("files"))
+        return od
 
     def _do_input(self, kind, x, y, direction, key, delay, hold=None, swipe=None):
         """Aim one gesture at the watch DISPLAY, in display fractions.

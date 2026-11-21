@@ -106,10 +106,13 @@ def _paths(name: str):
 
 def _read_holder(holder_path: str):
     try:
-        with open(holder_path) as fh:
-            return json.load(fh)
+        # Explicit UTF-8: the Windows default is the ANSI codepage, which
+        # garbled a non-ASCII `who` into a replacement char in the log.
+        with open(holder_path, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -155,14 +158,14 @@ def lease(name: str, timeout: float = DEFAULT_TIMEOUT, meta: dict | None = None,
                     "(held by {})".format(
                         timeout,
                         name,
-                        holder.get("who", "unknown"),
+                        (holder.get("who") or "unknown"),
                     )
                 ) from None
             if not announced:
                 holder = _read_holder(holder_path) or {}
                 log("[lease] waiting for '{}' — held by {} since {}".format(
                     name,
-                    holder.get("who", "unknown"),
+                    (holder.get("who") or "unknown"),
                     holder.get("since", "?"),
                 ))
                 announced = True
@@ -180,9 +183,14 @@ def lease(name: str, timeout: float = DEFAULT_TIMEOUT, meta: dict | None = None,
         if meta:
             holder.update(meta)
         try:
-            with open(holder_path, "w") as fh:
-                json.dump(holder, fh)
-        except OSError:
+            # Encoded before the file is opened, and with backslashreplace: a
+            # ``who`` from a non-UTF-8 argv/env byte is a lone surrogate on
+            # POSIX, which strict UTF-8 refuses -- after "w" had already
+            # truncated the file.
+            blob = json.dumps(holder, ensure_ascii=False).encode("utf-8", "backslashreplace")
+            with open(holder_path, "wb") as fh:
+                fh.write(blob)
+        except (OSError, ValueError):
             pass  # sidecar is best-effort visibility, not correctness
 
         # Publish to the env so child processes see this lease as held and

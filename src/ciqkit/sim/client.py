@@ -284,28 +284,62 @@ def _cached_broker_python_path() -> str:
     return os.path.join(proto.runtime_dir(), "broker-python")
 
 
+def _install_dir() -> str:
+    """Where the importing ciqkit package lives: identifies which checkout/venv
+    a cached interpreter was chosen for."""
+    import ciqkit
+    return os.path.dirname(os.path.abspath(ciqkit.__file__))
+
+
+def _read_cached_python() -> str | None:
+    """The cached interpreter, only if it was written for THIS ciqkit install.
+
+    The runtime dir is per-user, so two checkouts (two venvs) share it; a cache
+    from the other one made `ciqkit doctor` here spawn that checkout's broker.
+    The old plain-text format carries no install, so it counts as a miss.
+    """
+    try:
+        with open(_cached_broker_python_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("ciqkit_path") != _install_dir():
+        return None
+    py = data.get("python")
+    return py if isinstance(py, str) and py else None
+
+
 def resolve_broker_python() -> str | None:
     """First candidate that can import the broker AND the sim extras.
 
-    The winner is cached in the runtime dir so the probe (a subprocess import
-    per candidate) runs once per machine-boot rather than once per spawn.
+    An explicit CIQKIT_PYTHON always wins, and is never cached over. Otherwise
+    sys.executable comes next, then the cache of an earlier search (keyed on this ciqkit install) so
+    the probe (a subprocess import per candidate) runs once per machine-boot
+    rather than once per spawn.
     """
-    cache = _cached_broker_python_path()
-    try:
-        with open(cache) as f:
-            cached = f.read().strip()
+    explicit = os.environ.get("CIQKIT_PYTHON")
+    if explicit:
+        if _can_run_broker(explicit):
+            return explicit
+        # An explicit but broken choice: fall through to the other candidates
+        # (the caller's error message still names CIQKIT_PYTHON).
+    else:
+        # The interpreter running this client is the one that imported THIS
+        # ciqkit, so it is the right broker whenever it can run one.
+        if _can_run_broker(sys.executable):
+            return sys.executable
+        cached = _read_cached_python()
         if cached and os.path.exists(cached) and _can_run_broker(cached):
             return cached
-    except OSError:
-        pass
 
     for cand in broker_python_candidates():
         if _can_run_broker(cand):
-            try:
-                with open(cache, "w") as f:
-                    f.write(cand)
-            except OSError:
-                pass
+            if not explicit:
+                try:
+                    with open(_cached_broker_python_path(), "w", encoding="utf-8") as f:
+                        json.dump({"python": cand, "ciqkit_path": _install_dir()}, f)
+                except OSError:
+                    pass
             return cand
     return None
 

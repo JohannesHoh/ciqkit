@@ -99,6 +99,18 @@ def check_console_scripts() -> tuple[bool, list[str]]:
     return ok, out
 
 
+def broker_install_check(reply: dict, own_install: str) -> dict | None:
+    """A warning when a running broker was started from another ciqkit install
+    (another checkout or venv), else None. Older brokers report no install."""
+    theirs = reply.get("install")
+    if not theirs or os.path.normcase(str(theirs)) == os.path.normcase(own_install):
+        return None
+    return _check("broker", "warn",
+                  f"the running broker (pid {reply.get('pid')}, ciqkit "
+                  f"{reply.get('version', '?')}) runs code from {theirs}, not "
+                  f"{own_install}; run `ciqkit sim shutdown` to start this one")
+
+
 def _environment_checks(checks: list) -> None:
     import platform
     from .sim import preflight
@@ -146,6 +158,18 @@ def _environment_checks(checks: list) -> None:
                     "run `ciqkit sim restore`"))
     except Exception as exc:   # never let a diagnostic break the diagnostic
         checks.append(_check("seed", "warn", f"could not be checked: {exc}"))
+
+    try:
+        from .sim.client import BrokerNotRunning, Client
+        try:
+            warn = broker_install_check(Client(autospawn=False).ping(),
+                                        os.path.dirname(os.path.abspath(__file__)))
+            if warn:
+                checks.append(warn)
+        except (BrokerNotRunning, OSError):
+            pass   # no broker running is normal
+    except Exception as exc:   # a diagnostic must not break the diagnostic
+        checks.append(_check("broker", "info", f"could not be checked: {exc}"))
 
     preflight.reset()
     try:

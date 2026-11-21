@@ -253,6 +253,133 @@ def kill_tree(root: int, passes: int = 3) -> None:
         doomed = order
 
 
+# ── job objects ──────────────────────────────────────────────────────────────
+# A job holds every descendant of a process assigned to it, whatever happens to
+# the processes in between, so it reaches what the parent-link walk above
+# cannot: a grandchild whose parent has already exited. A venv's
+# Scripts\python.exe is such a parent -- a launcher that starts the real
+# interpreter as its own child -- and so is a ``cmd /c`` that exits early.
+# The orchestration (start suspended, assign, resume, fall back to the walk)
+# lives in :func:`ciqkit._compat.run_killing_tree`; these are the bare calls.
+
+_JobObjectExtendedLimitInformation = 9
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+PROCESS_SET_QUOTA = 0x0100
+PROCESS_SUSPEND_RESUME = 0x0800
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", wt.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wt.LARGE_INTEGER),
+                ("LimitFlags", wt.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wt.DWORD),
+                ("Affinity", ctypes.c_size_t),          # ULONG_PTR
+                ("PriorityClass", wt.DWORD),
+                ("SchedulingClass", wt.DWORD)]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_ulonglong) for name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+kernel32.CreateJobObjectW.restype = wt.HANDLE
+kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wt.LPCWSTR)
+kernel32.SetInformationJobObject.restype = wt.BOOL
+kernel32.SetInformationJobObject.argtypes = (wt.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                             wt.DWORD)
+kernel32.AssignProcessToJobObject.restype = wt.BOOL
+kernel32.AssignProcessToJobObject.argtypes = (wt.HANDLE, wt.HANDLE)
+kernel32.TerminateJobObject.restype = wt.BOOL
+kernel32.TerminateJobObject.argtypes = (wt.HANDLE, wt.UINT)
+# Undocumented but present in every NT ntdll: resumes every thread of a
+# process. CREATE_SUSPENDED leaves the main thread suspended, and CPython's
+# Popen closes that thread's handle before returning, so ResumeThread is not
+# available to us.
+_ntdll.NtResumeProcess.restype = ctypes.c_long
+_ntdll.NtResumeProcess.argtypes = (wt.HANDLE,)
+
+
+def _set_job_flags(job: int, flags: int) -> bool:
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = flags
+    return bool(kernel32.SetInformationJobObject(job, _JobObjectExtendedLimitInformation,
+                                                 ctypes.byref(info), ctypes.sizeof(info)))
+
+
+def create_kill_job() -> int | None:
+    """A new anonymous job that kills its processes when its last handle closes.
+
+    No breakaway flag, on purpose: with nested jobs a child that silently breaks
+    away from an inner job (the venv launcher's own job allows exactly that)
+    keeps climbing the chain until it meets a job that permits no breakaway --
+    which has to be this one, or the grandchild escapes again. Kill-on-close
+    also means a caller that dies mid-run takes the tree with it. None if
+    either call fails.
+    """
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    if not _set_job_flags(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE):
+        kernel32.CloseHandle(job)
+        return None
+    return job
+
+
+def assign_to_job(job: int, pid: int) -> bool:
+    """Put ``pid`` in ``job``; False if that is refused -- ERROR_ACCESS_DENIED when
+    the caller's own job forbids it (Windows before 8 cannot nest jobs)."""
+    h = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, int(pid))
+    if not h:
+        return False
+    try:
+        return bool(kernel32.AssignProcessToJobObject(job, h))
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def resume_process(pid: int) -> bool:
+    """Resume a process started with CREATE_SUSPENDED."""
+    h = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+    if not h:
+        return False
+    try:
+        return _ntdll.NtResumeProcess(h) == 0   # STATUS_SUCCESS
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def terminate_job(job: int) -> bool:
+    """Terminate every process in ``job`` (and in any job nested in it)."""
+    return bool(kernel32.TerminateJobObject(job, 1))
+
+
+def disarm_job(job: int) -> bool:
+    """Drop kill-on-close, so closing the handle leaves the job's processes be.
+
+    For a run that finished on its own: anything still alive then has already
+    closed the output pipes (``communicate`` saw EOF) and is a deliberate
+    background process, which POSIX leaves running too.
+    """
+    return _set_job_flags(job, 0)
+
+
+def close_handle(h: int) -> None:
+    kernel32.CloseHandle(h)
+
+
 def session_id(pid: int | None = None) -> int | None:
     """Terminal-services session of ``pid`` (default: this process)."""
     out = wt.DWORD()

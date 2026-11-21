@@ -172,46 +172,95 @@ def _device_mask(sim_json):
     return watch, valid
 
 
+#: Least share of the device art's own area (display cut-out excluded) that
+#: has to be inside the capture for a placement to count. The Windows panel
+#: cuts the strap off at the bottom -- venu3's art is 882 px tall, taller than
+#: the panel on a 200 % laptop -- so a placement may run past the capture's
+#: bottom edge and is scored on the rows in view only. The floor keeps a
+#: sliver of overlap from scoring 1.0 on plain background.
+_MIN_IN_VIEW = 0.5
+
+#: Agreement a placement needs before a click is aimed through it.
+_MIN_AGREEMENT = 0.9
+
+
 def _match_offset(cap, dev, valid, step, around=None, radius=None):
     """(score, dx, dy): where mask ``dev`` best sits inside mask ``cap``
     (offsets of dev's top-left in cap), by agreement over dev's own area.
-    Searches every offset at ``step`` px, or +-radius around ``around``."""
+    Searches every offset at ``step`` px, or +-radius around ``around``.
+
+    Both sides of the art must fit (they are always in view); the bottom may
+    run past the capture's edge, and is then scored over the visible rows,
+    so long as at least ``_MIN_IN_VIEW`` of the art is visible.
+    """
     h, w = dev.shape
     H, W = cap.shape
-    n = float(valid.sum()) or 1.0
-    if h > H or w > W:
+    if w > W or H == 0:
         return None
+    # valid pixels in dev[:k], for every k: the denominator of a cut placement
+    vrows = np.concatenate(([0], np.cumsum(valid.sum(axis=1))))
+    need = _MIN_IN_VIEW * float(vrows[-1])
     if around is None:
-        xs, ys = range(0, W - w + 1, step), range(0, H - h + 1, step)
+        xs, ys = range(0, W - w + 1, step), range(0, H, step)
     else:
         ax, ay = around
         xs = range(max(0, ax - radius), min(W - w, ax + radius) + 1)
-        ys = range(max(0, ay - radius), min(H - h, ay + radius) + 1)
+        ys = range(max(0, ay - radius), min(H - 1, ay + radius) + 1)
     best = None
     for dy in ys:
+        k = min(h, H - dy)
+        nk = float(vrows[k])
+        if nk <= 0 or nk < need:
+            continue
+        dk, vk = dev[:k], valid[:k]
         for dx in xs:
-            sc = float(((cap[dy:dy + h, dx:dx + w] == dev) & valid).sum()) / n
+            sc = float(((cap[dy:dy + k, dx:dx + w] == dk) & vk).sum()) / nk
             if best is None or sc > best[0]:
                 best = (sc, dx, dy)
     return best
 
 
-def sim_device_point(img, device_id, px, py, sim_json=None, scale=None):
-    """Map a point in DEVICE-IMAGE pixels (the coordinates simulator.json
-    uses) to pixels of ``img``, a capture of the simulator window.
+def _scale_candidates(scale):
+    """Device-image -> capture scales to try, most likely first.
 
-    The simulator draws the device PNG 1:1 in logical pixels, so the capture
-    holds it at the Retina scale (``scale``; 1 and 2 are tried when omitted)
-    somewhere inside the window chrome. The offset is found by sliding the
-    PNG's own silhouette over the capture's and keeping the best agreement --
-    chrome-proof (title bar, border and toolbar only cost every candidate the
-    same few pixels) and content-proof (the watch body is far larger than any
-    screen content). Returns (x, y) floats, or None when no placement
-    agrees well enough: not this device's art, or a differently drawn view.
+    ``scale`` is the caller's hint. 1 and 2 cover the cases seen: macOS
+    draws the PNG 1:1 in logical points, so at the Retina scale of the grab;
+    the DPI-unaware Windows simulator draws it 1:1 in its own pixels, which
+    is what PrintWindow returns -- 1.0, whatever ``retina_scale`` (0.5 at
+    200 %) says, so a caller passing the Retina scale there aimed a
+    half-size silhouette that could never match.
+
+    No free (silhouette-width-ratio) scale: tried on real device art it let
+    another device's silhouette clear the agreement floor -- 46 of 480
+    cross-device pairs accepted against 20 with stock scales only -- and a
+    confident press on the wrong device's button is exactly the unverified
+    action this project exists to prevent. A view at some other size fails
+    to align, with diagnostics, instead.
     """
-    path = sim_json or _sim_json_path(device_id)
-    if not path:
-        return None
+    out = []
+
+    def add(v):
+        if v and 0.25 <= v <= 4 and all(abs(v - o) > 0.02 for o in out):
+            out.append(float(v))
+    try:
+        add(float(scale) if scale else None)
+    except (TypeError, ValueError):
+        pass
+    add(1.0)
+    add(2.0)
+    return out
+
+
+def _align_device_art(img, path, scale=None):
+    """Place the device PNG's silhouette in capture ``img``.
+
+    Returns ``(best, tried, cap_mask, dev_mask)``: ``best`` is ``(score, ox,
+    oy, scale)`` of the best-scoring scale searched (every stock scale is
+    searched, so a near-miss at the first one cannot beat a true fit at a
+    later one), or None;
+    ``tried`` is one ``(scale, score, dx, dy)`` per scale searched. None when
+    the profile or its PNG is unreadable.
+    """
     try:
         mtime = os.stat(path).st_mtime_ns
     except OSError:
@@ -221,10 +270,10 @@ def sim_device_point(img, device_id, px, py, sim_json=None, scale=None):
         return None
     dev, valid = masks
     cap_full = np.asarray(img.convert("RGB")).min(axis=2) < _DARK
-    best = None
-    for sc in ([float(scale)] if scale else [1.0, 2.0]):
-        if sc <= 0:
-            continue
+    best, tried = None, []
+    for sc in _scale_candidates(scale):
+        if best is not None and best[0] >= 0.995:
+            break               # an exact fit: no other scale can beat it
         size = (max(1, round(dev.shape[1] * sc)), max(1, round(dev.shape[0] * sc)))
 
         def scaled(m, size=size):
@@ -234,14 +283,119 @@ def sim_device_point(img, device_id, px, py, sim_json=None, scale=None):
         # coarse (every 4th pixel of both), then exact within +-4
         coarse = _match_offset(cap_full[::4, ::4], d[::4, ::4], v[::4, ::4], 1)
         if coarse is None:
+            tried.append((sc, None, None, None))
             continue
         fine = _match_offset(cap_full, d, v, 1, (coarse[1] * 4, coarse[2] * 4), 4)
-        if fine and (best is None or fine[0] > best[0]):
+        if fine is None:
+            tried.append((sc, None, None, None))
+            continue
+        tried.append((sc, fine[0], fine[1], fine[2]))
+        if best is None or fine[0] > best[0]:
             best = (fine[0], fine[1], fine[2], sc)
-    if best is None or best[0] < 0.9:
+    return best, tried, cap_full, dev
+
+
+def sim_device_point(img, device_id, px, py, sim_json=None, scale=None):
+    """Map a point in DEVICE-IMAGE pixels (the coordinates simulator.json
+    uses) to pixels of ``img``, a capture of the simulator window.
+
+    The simulator draws the device PNG 1:1 in its own pixels, so the capture
+    holds it at some scale (``scale`` is a hint: tried first, then 1 and 2
+    -- see _scale_candidates) somewhere inside the
+    window chrome, possibly with the bottom cut off. The offset is found by
+    sliding the PNG's own silhouette over the capture's and keeping the best
+    agreement -- chrome-proof (title bar, border and toolbar only cost every
+    candidate the same few pixels) and content-proof (the watch body is far
+    larger than any screen content). Returns (x, y) floats, or None when no
+    placement agrees well enough: not this device's art, or a differently
+    drawn view.
+    """
+    path = sim_json or _sim_json_path(device_id)
+    if not path:
+        return None
+    r = _align_device_art(img, path, scale)
+    if r is None:
+        return None
+    best = r[0]
+    if best is None or best[0] < _MIN_AGREEMENT:
         return None
     _score, ox, oy, sc = best
     return ox + px * sc, oy + py * sc
+
+
+def explain_device_alignment(img, device_id, out_dir, scale=None, sim_json=None):
+    """Write what a failed device-art alignment looked at into ``out_dir``
+    and return it as a dict, so one bad run on a platform we cannot test on
+    yields hard data instead of "could not align".
+
+    Files: ``capture-mask.png`` (the capture's dark silhouette -- what the
+    alignment compares; the "edges" it found), ``device-mask.png`` (the
+    device PNG's silhouette, at the best scale tried) and ``overlay.png``
+    (those two at the best placement on a white canvas: red where they
+    disagree, green where they agree). Silhouettes only: neither the raw
+    capture (the simulator draws Garmin's device art in it) nor the device
+    image is ever written, and the overlay holds no capture pixels (its path
+    is in the dict). Never raises for a missing profile; returns what it has.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    info = {"device": device_id, "scale_hint": scale,
+            "capture_size": list(img.size), "min_agreement": _MIN_AGREEMENT,
+            "min_in_view": _MIN_IN_VIEW, "files": {}}
+    path = sim_json or _sim_json_path(device_id)
+    info["simulator_json"] = path
+    rgb = img.convert("RGB")
+    cap_mask = np.asarray(rgb).min(axis=2) < _DARK
+    info["capture_dark_bbox"] = _dark_bbox(np.asarray(rgb))
+    p = os.path.join(out_dir, "capture-mask.png")
+    Image.fromarray(cap_mask.astype(np.uint8) * 255).save(p)
+    info["files"]["capture_mask"] = p
+    r = _align_device_art(rgb, path, scale) if path else None
+    if r is None:
+        info["error"] = "device profile or its image could not be read"
+        return info
+    best, tried, _cap, dev = r
+    info["tried"] = [{"scale": sc, "score": None if s is None else round(s, 4),
+                      "dx": dx, "dy": dy} for sc, s, dx, dy in tried]
+    info["best"] = None if best is None else {
+        "score": round(best[0], 4), "dx": best[1], "dy": best[2], "scale": best[3]}
+    info["device_mask_size"] = [int(dev.shape[1]), int(dev.shape[0])]
+    cols = np.where(dev.sum(axis=0) > 2)[0]
+    rows = np.where(dev.sum(axis=1) > 2)[0]
+    if cols.size and rows.size:
+        info["device_dark_bbox"] = (int(cols[0]), int(rows[0]),
+                                    int(cols[-1]) + 1, int(rows[-1]) + 1)
+    sc = best[3] if best else 1.0
+    size = (max(1, round(dev.shape[1] * sc)), max(1, round(dev.shape[0] * sc)))
+    d = np.asarray(Image.fromarray(dev.astype(np.uint8) * 255).resize(
+        size, Image.NEAREST)) > 127
+    p = os.path.join(out_dir, "device-mask.png")
+    Image.fromarray(d.astype(np.uint8) * 255).save(p)
+    info["files"]["device_mask"] = p
+    if best is not None:
+        # Mask-only canvas: blending the capture back in would keep Garmin's
+        # art (as the simulator draws it) in a file that gets sent around.
+        over = np.full(cap_mask.shape + (3,), 255, np.uint8)
+        H, W = cap_mask.shape
+        ox, oy = best[1], best[2]
+        h, w = min(d.shape[0], H - oy), min(d.shape[1], W - ox)
+        if h > 0 and w > 0:
+            region = over[oy:oy + h, ox:ox + w]
+            agree = cap_mask[oy:oy + h, ox:ox + w] == d[:h, :w]
+            tint = np.where(agree[..., None], [0, 160, 0], [230, 0, 0])
+            dev_px = d[:h, :w] | ~agree
+            region[dev_px] = tint[dev_px].astype(np.uint8)
+        p = os.path.join(out_dir, "overlay.png")
+        Image.fromarray(over).save(p)
+        info["files"]["overlay"] = p
+    try:
+        import json
+        p = os.path.join(out_dir, "alignment.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(info, fh, indent=2, default=str)
+        info["files"]["json"] = p
+    except (OSError, TypeError, ValueError):
+        pass
+    return info
 
 
 @functools.lru_cache(maxsize=8)

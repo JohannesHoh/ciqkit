@@ -538,6 +538,7 @@ def test_broker_candidates_are_unique(monkeypatch):
 def test_resolve_broker_python_skips_unviable(monkeypatch, tmp_path):
     from ciqkit.sim import client
 
+    monkeypatch.delenv("CIQKIT_PYTHON", raising=False)
     monkeypatch.setattr(client.proto, "runtime_dir", lambda: str(tmp_path))
     monkeypatch.setattr(client, "broker_python_candidates",
                         lambda: ["/no/such/python", "/usr/bin/works"])
@@ -546,12 +547,13 @@ def test_resolve_broker_python_skips_unviable(monkeypatch, tmp_path):
 
     assert client.resolve_broker_python() == "/usr/bin/works"
     # and it is cached for the next spawn
-    assert (tmp_path / "broker-python").read_text().strip() == "/usr/bin/works"
+    assert client._read_cached_python() == "/usr/bin/works"
 
 
 def test_resolve_broker_python_reprobes_a_stale_cache(monkeypatch, tmp_path):
     from ciqkit.sim import client
 
+    monkeypatch.delenv("CIQKIT_PYTHON", raising=False)
     monkeypatch.setattr(client.proto, "runtime_dir", lambda: str(tmp_path))
     (tmp_path / "broker-python").write_text("/gone/python\n")
     monkeypatch.setattr(client, "broker_python_candidates", lambda: ["/usr/bin/works"])

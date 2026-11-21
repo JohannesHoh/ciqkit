@@ -73,7 +73,7 @@ from .framing import (               # noqa: F401  -- re-exported API
     apply_device_art_frame, autocrop_screen_box, detect_device_art_geometry,
     device_art_canvas_mask, device_art_screen_circle, find_display_circle,
     looks_like_app_loaded, sim_display_box,
-    sim_device_keys, sim_device_point, sim_button_point,
+    sim_device_keys, sim_device_point, sim_button_point, explain_device_alignment,
     frame_device_art_capture, make_framed_screenshot, make_sdk_framed_screenshot,
 )
 from .fit_panel import (             # noqa: F401  -- re-exported API

@@ -55,6 +55,7 @@ class Listener:
         self.sock = sock
         self.endpoint = endpoint
         self.token = token
+        self.last_auth_empty = False    # for the log line only; racy by design
 
     def accept(self):
         conn, _ = self.sock.accept()
@@ -70,6 +71,7 @@ class Listener:
         if self.token is None:
             return True
         line = reader.readline(4096)
+        self.last_auth_empty = not line.strip()
         try:
             got = proto.loads(line).get(AUTH_FIELD, "")
         except (ValueError, AttributeError, UnicodeDecodeError):
