@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 
@@ -38,6 +39,8 @@ __all__ = ["record", "clear", "pending", "recover", "stale", "owner_alive",
            "journal_path"]
 
 _JOURNAL = "journal.json"
+
+log = logging.getLogger(__name__)
 
 
 def _dir() -> str:
@@ -60,14 +63,40 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _fsync_dir(d: str) -> None:
+    """Make a rename/creation in ``d`` durable. POSIX only: Windows cannot open a dir."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return   # best-effort: a filesystem that refuses still has the file fsync
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass     # same: durability is a bonus, the hash check in recover() is the guard
+    finally:
+        os.close(fd)
+
+
+def _write_durable(path: str, data: bytes) -> None:
+    """Write ``data`` to ``path`` via tmp + fsync + replace, so a crash leaves
+    either the old file or the whole new one, never a truncated blob."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 def _write_journal(pid, files) -> str:
     jp = journal_path()
-    tmp = jp + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump({"pid": pid,
-                   "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                   "files": files}, fh)
-    os.replace(tmp, jp)   # atomic: a reader never sees a half-written journal
+    payload = json.dumps({"pid": pid,
+                          "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                          "files": files}).encode()
+    _write_durable(jp, payload)   # atomic: a reader never sees a half-written journal
+    _fsync_dir(os.path.dirname(jp))
     return jp
 
 
@@ -88,11 +117,14 @@ def record(entries) -> str:
         if path in kept_paths:
             # A stale entry for this very file; the fresh backup supersedes it.
             files = [e for e in files if e.get("path") != path]
-        with open(blob, "wb") as fh:
-            fh.write(original)
+        # The blob must be on disk before the journal that points at it: a crash
+        # between the two would otherwise leave an entry naming an empty or
+        # truncated copy of the user's source.
+        _write_durable(blob, original)
         files.append({"path": path, "backup": blob,
                       "original_sha256": _sha(original),
                       "patched_sha256": _sha(patched)})
+    _fsync_dir(d)   # the blobs' directory entries, before the journal names them
     return _write_journal(os.getpid(), files)
 
 
@@ -163,6 +195,21 @@ def recover() -> list[str]:
             continue             # already back to normal; nothing to do
         if digest != entry.get("patched_sha256"):
             kept.append(entry)   # changed since we patched it — hands off
+            continue
+        want = entry.get("original_sha256")
+        if want is None:
+            # Journal from before the hash was recorded: nothing to verify the
+            # blob against, so keep the old behaviour but leave a trace.
+            log.warning("seed journal entry for %s has no original_sha256; "
+                        "restoring from an unverified backup", path)
+        elif _sha(original) != want:
+            # A crash (or a full disk) left a truncated/empty blob. Writing it
+            # over the user's file would turn a recoverable patch into data
+            # loss, so leave the file alone and let `doctor`/`sim restore`
+            # show the blob for a human.
+            log.warning("seed backup %s does not match its recorded hash; "
+                        "not restoring %s", blob, path)
+            kept.append(entry)
             continue
         try:
             with open(path, "wb") as fh:

@@ -4,6 +4,7 @@ mistyped command from doing something surprising.
 None of this touches the simulator.
 """
 
+import os
 import sys
 import json
 
@@ -523,7 +524,8 @@ def test_broker_candidates_lead_with_env_override(monkeypatch):
 
     monkeypatch.setenv("CIQKIT_PYTHON", "/opt/some/python")
     cands = client.broker_python_candidates()
-    assert cands[0] == "/opt/some/python"
+    # abspath: on Windows a rooted path without a drive is on the current drive.
+    assert cands[0] == os.path.abspath("/opt/some/python")
     assert sys.executable in cands
 
 
@@ -574,7 +576,7 @@ def test_spawn_daemon_uses_the_resolved_interpreter(monkeypatch, tmp_path):
     monkeypatch.setattr(client.subprocess, "Popen", fake_popen)
     client.spawn_daemon(str(tmp_path / "sock"))
     assert seen["argv"][0] == "/usr/bin/works"
-    assert seen["argv"][1:] == ["-m", "ciqkit.sim.broker"]
+    assert seen["argv"][1:] == ["-P", "-m", "ciqkit.sim.broker"]
 
 
 def test_spawned_daemon_does_not_inherit_a_held_lease(monkeypatch, tmp_path):

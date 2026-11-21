@@ -146,9 +146,9 @@ jobs:
           fi
           echo "no SDK index tracked"
 
-      - name: No SDK archives or device images
+      - name: No SDK archives, device images or private keys
         run: |
-          hits=$(git ls-files | grep -Ei '\.(iq|prg|der|jks|keystore)$|connectiq-sdk' || true)
+          hits=$(git ls-files | grep -Ei '\.(iq|prg|der|jks|keystore|pem|p12|key)$|(^|/)\.env($|\.)|connectiq-sdk' || true)
           if [ -n "$hits" ]; then
             echo "::error::unexpected binary/SDK artefacts tracked:"; echo "$hits"; exit 1
           fi

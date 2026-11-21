@@ -154,6 +154,11 @@ def reach_chunk(*, screen, steps, anchor=None) -> Chunk:
     extra = sum(_num(st.get("timeout"), MARKER_TIMEOUT_S) + SHOT_EXPECTED_S
                 for st in steps if isinstance(st, dict) and st.get("kind") == "shot_on")
     expected, max_s = _reach_budget(len(steps), extra)
+    # A shot_on step may carry its own out_dir; like SHOT's it must reach the
+    # broker absolute (validate_job refuses a relative one).
+    steps = [dict(st, out_dir=abs_out_dir(st["out_dir"]))
+             if isinstance(st, dict) and st.get("kind") == "shot_on" and st.get("out_dir")
+             else st for st in steps]
     return Chunk(ChunkKind.REACH,
                  {"screen": screen, "steps": steps, "anchor": anchor or None},
                  expected_s=expected, max_s=max_s)
@@ -198,10 +203,22 @@ def screen_chunks(*, project, device, name, prg=None, anchor=None, seed=None,
 MARKER_TIMEOUT_S = 20.0
 
 
+def abs_out_dir(out_dir):
+    """``out_dir`` as the broker must see it: absolute.
+
+    The broker's cwd is not the caller's, so a relative directory would land
+    somewhere else, and validate_job refuses a relative one. Resolved here, in
+    the front-ends' shared builder, never in the broker.
+    """
+    if isinstance(out_dir, str) and out_dir:
+        return os.path.abspath(os.path.expanduser(out_dir))
+    return out_dir
+
+
 def _shot_chunk(name, *, crop=True, frame=True, anchor=None, out_dir=None,
                 marker=None, marker_timeout_s=None) -> Chunk:
     args = {"name": name, "crop": crop, "frame": frame, "anchor": anchor,
-            "out_dir": out_dir, "settle_s": DEFAULT_SHOT_SETTLE_S}
+            "out_dir": abs_out_dir(out_dir), "settle_s": DEFAULT_SHOT_SETTLE_S}
     wait = 0.0
     if marker:
         wait = float(marker_timeout_s or MARKER_TIMEOUT_S)
@@ -248,7 +265,8 @@ def record_chunks(*, project, device, name, duration_s, interval_ms, playback_ms
     chunks.append(Chunk(ChunkKind.RECORD,
                         {"name": name, "duration_s": duration_s,
                          "interval_ms": interval_ms, "crop": crop, "frame": frame,
-                         "playback_ms": playback_ms, "out_dir": out_dir,
+                         "playback_ms": playback_ms,
+                         "out_dir": abs_out_dir(out_dir),
                          "keep_frames": keep_frames,
                          "settle_s": DEFAULT_SHOT_SETTLE_S},
                         expected_s=duration_s + 8, max_s=record_budget(duration_s)))

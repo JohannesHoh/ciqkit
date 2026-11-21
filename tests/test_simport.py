@@ -92,7 +92,7 @@ def _sdk(tmp_path, with_class=True):
 
 @posix_only
 def test_shim_engages_only_when_a_foreign_listener_is_in_the_way(monkeypatch, tmp_path):
-    monkeypatch.setattr(simport.shutil, "which", lambda n: "/usr/bin/java")
+    monkeypatch.setattr(simport, "which_no_cwd", lambda n: "/usr/bin/java")
     monkeypatch.setattr(simport, "_shim_path", lambda: "/shim.sh")
     sdk = _sdk(tmp_path)
     _fake(monkeypatch, [Listener(1234, 1, "LM Studio"), Listener(1235, 2, "simulator")], [2])
@@ -107,7 +107,7 @@ def test_shim_engages_only_when_a_foreign_listener_is_in_the_way(monkeypatch, tm
 
 @posix_only
 def test_shim_falls_back_when_the_sdk_lacks_the_class(monkeypatch, tmp_path):
-    monkeypatch.setattr(simport.shutil, "which", lambda n: "/usr/bin/java")
+    monkeypatch.setattr(simport, "which_no_cwd", lambda n: "/usr/bin/java")
     _fake(monkeypatch, [Listener(1234, 1, "LM Studio"), Listener(1235, 2, "simulator")], [2])
     assert simport.monkeydo_command(_sdk(tmp_path, with_class=False),
                                     "a.prg", "venu3")[2] == "monkeydo"

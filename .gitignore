@@ -44,6 +44,11 @@ examples/*/bin/
 *.der
 *.jks
 *.keystore
+*.pem
+*.p12
+*.key
+.env
+.env.*
 
 # coverage data
 .coverage

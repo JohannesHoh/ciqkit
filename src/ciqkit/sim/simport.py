@@ -50,12 +50,13 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import shutil
 import subprocess
 import sys
 import time
 import zipfile
 from dataclasses import dataclass, field
+
+from .._compat import which_no_cwd
 
 MONKEYDO_PORTS = range(1234, 1239)   # ShellUtils.findSimulatorPort, SDK 9.1.0
 SHELL_PROBE_TIMEOUT_S = 16           # measured: bin/shell vs a non-simulator listener
@@ -338,7 +339,7 @@ def _has_monkeydo_class(jar: str) -> bool:
 
 def java_exe() -> str | None:
     """The java the SDK's own scripts would run: PATH first, then JAVA_HOME."""
-    found = shutil.which("java")
+    found = which_no_cwd("java")   # never a java.exe in the cwd (Windows)
     if found:
         return found
     home = os.environ.get("JAVA_HOME")

@@ -441,6 +441,208 @@ def test_a_stale_endpoint_reads_as_not_running(short_runtime_dir, monkeypatch):
         transport.connect(ep + ".missing", timeout=5)
 
 
+@pytest.fixture
+def tcp_broker(short_runtime_dir, monkeypatch):
+    """A real serve() on the TCP transport, torn down after the test."""
+    monkeypatch.setenv("CIQSIM_TRANSPORT", "tcp")
+    monkeypatch.setattr(broker_mod, "leaselib", None)
+    ep = os.path.join(short_runtime_dir, "tcp.endpoint")
+    th = _start(ep)
+    yield ep
+    try:
+        _rpc(ep, {"op": proto.Op.SHUTDOWN})
+    except OSError:
+        pass
+    th.join(timeout=10)
+
+
+@pytest.mark.parametrize("first_line", [
+    '{"auth": "\u00fc"}\n'.encode("utf-8"),               # raw non-ASCII
+    b'{"auth": "\\u00e9\\u00e9"}\n',                        # escaped non-ASCII
+    b'{"auth": "\\ud800"}\n',                               # a lone surrogate
+    b'{"auth": 5}\n',
+    b'["auth"]\n',
+    b'\xff\xfe\n',                                          # not UTF-8 at all
+])
+def test_a_token_of_the_wrong_shape_is_unauthorized_not_a_traceback(tcp_broker,
+                                                                    first_line):
+    """compare_digest raises TypeError on a str with non-ASCII in it; that
+    escaped the auth check as a traceback and a dropped connection."""
+    s, _info = _raw_tcp(tcp_broker)
+    try:
+        s.sendall(first_line)
+        assert proto.loads(s.makefile("rb").readline()) == {
+            "ok": False, "error": "unauthorized", "code": proto.E_UNAUTHORIZED}
+    finally:
+        s.close()
+
+
+def test_a_peer_dripping_its_auth_line_is_cut_off_at_the_deadline(tcp_broker,
+                                                                  monkeypatch):
+    """The 10 s used to be a timeout per recv, so one byte every few seconds
+    held the connection -- and a handler slot -- for as long as the peer liked.
+    It is one deadline for the whole line now."""
+    import select
+    monkeypatch.setattr(transport, "AUTH_DEADLINE_S", 1.0)
+    s, _info = _raw_tcp(tcp_broker)
+    drip = iter(b'{"auth": "' + b"0" * 64 + b'"}\n')
+    t0 = time.monotonic()
+    try:
+        # Each byte comes well inside any per-read timeout (0.2 s < 1 s), and
+        # the whole line would take ~15 s.
+        while not select.select([s], [], [], 0.2)[0]:
+            assert time.monotonic() - t0 < 3, "the dripping peer was never cut off"
+            s.sendall(bytes([next(drip)]))
+        reply = s.makefile("rb").readline()
+        elapsed = time.monotonic() - t0
+    finally:
+        s.close()
+    assert proto.loads(reply) == {"ok": False, "error": "unauthorized",
+                                  "code": proto.E_UNAUTHORIZED}
+    assert 0.9 <= elapsed < 2.5
+
+
+def test_unauthenticated_connections_cannot_starve_the_owner(tcp_broker, monkeypatch):
+    """Anyone local can open connections to a loopback port. Parked ones must
+    neither use up the handler slots nor fill the pre-auth pool so that the
+    owner's client -- which shows its token at once -- cannot get in."""
+    monkeypatch.setattr(transport, "PREAUTH_MAX", 4)
+    monkeypatch.setattr(broker_mod, "MAX_CONNS", 2)
+    monkeypatch.setattr(broker_mod, "_CONN_SLOTS", threading.BoundedSemaphore(2))
+    parked = []
+    try:
+        for _ in range(10):         # more than both the pool and the slots
+            s, _info = _raw_tcp(tcp_broker)
+            s.sendall(b'{"auth": "')                # and never finishes
+            parked.append(s)
+        time.sleep(0.3)             # let the accept loop take them all
+        for _ in range(3):          # more than MAX_CONNS, one after another
+            assert _rpc(tcp_broker, {"op": proto.Op.PING})["ok"] is True
+        # The pool evicted the oldest: shut down, not left to idle.
+        parked[0].settimeout(5)
+        try:
+            assert parked[0].recv(64) == b""
+        except ConnectionResetError:
+            pass                    # Windows answers a shutdown with a reset
+    finally:
+        for s in parked:
+            s.close()
+
+
+def test_a_flood_of_bad_tokens_is_not_answered_past_the_refusal_bound(tcp_broker,
+                                                                      monkeypatch):
+    """A refused connection lingers up to half a second after it left the
+    pre-auth pool; unbounded, a flood of them ran the daemon out of fds."""
+    monkeypatch.setattr(broker_mod, "_REFUSE_SLOTS", threading.BoundedSemaphore(1))
+    assert broker_mod._REFUSE_SLOTS.acquire(blocking=False)     # none left
+    s, _info = _raw_tcp(tcp_broker)
+    try:
+        s.sendall(b"POST / HTTP/1.1\r\n\r\n")
+        s.settimeout(5)
+        try:
+            assert s.recv(64) == b""        # closed, not answered
+        except ConnectionResetError:
+            pass                            # Windows
+    finally:
+        s.close()
+    assert _rpc(tcp_broker, {"op": proto.Op.PING})["ok"] is True
+
+
+def test_accept_running_out_of_fds_does_not_stop_the_broker(tcp_broker, monkeypatch):
+    """EMFILE from accept() used to propagate out of serve() and end the daemon
+    with jobs in flight."""
+    import errno
+    real = socket.socket.accept
+    left = [1]
+
+    def flaky(self):
+        if left[0] > 0 and self.type == socket.SOCK_STREAM and self.getsockname()[1] == port:
+            left[0] -= 1
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real(self)
+
+    port = _read_json(tcp_broker)["port"]
+    monkeypatch.setattr(socket.socket, "accept", flaky)
+    # The accept loop wakes at least every second.
+    assert _rpc(tcp_broker, {"op": proto.Op.PING}, timeout=15)["ok"] is True
+    assert left[0] == 0
+
+
+def test_an_oversized_request_line_is_refused(running_broker, monkeypatch):
+    """A request line is read no further than the cap, then answered and
+    closed: an unbounded readline buffered whatever a client sent."""
+    monkeypatch.setattr(broker_mod, "MAX_LINE", 1024)
+    s = transport.connect(running_broker, timeout=10)
+    try:
+        s.sendall(b'{"op": "ping", "pad": "' + b"a" * 4096 + b'"}\n')
+        f = s.makefile("rb")
+        r = proto.loads(f.readline())
+        assert r["ok"] is False and "1024 bytes" in r["error"]
+        assert f.readline() == b""                  # and the connection closed
+    except ConnectionResetError:
+        pytest.fail("the refusal was lost to a reset")
+    finally:
+        s.close()
+    assert _rpc(running_broker, {"op": proto.Op.PING})["ok"] is True
+
+
+def _dead_pid() -> int:
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+def test_a_stale_endpoint_never_hands_its_token_to_a_squatter(short_runtime_dir,
+                                                              monkeypatch):
+    """A broker killed hard leaves its endpoint file; by the time a client
+    reads it another account may be listening on that port. The token would
+    gain it nothing against the next broker, but it could pose as one -- so
+    the client checks the writer is alive (and, on Windows, owns the port)
+    before it sends anything."""
+    monkeypatch.setenv("CIQSIM_TRANSPORT", "tcp")
+    squatter = socket.socket()
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(4)
+    squatter.settimeout(0.3)
+    port = squatter.getsockname()[1]
+    ep = os.path.join(short_runtime_dir, "squat.endpoint")
+
+    def endpoint(pid):
+        with open(ep, "w") as fh:
+            json.dump({"host": "127.0.0.1", "port": port, "token": "t" * 64,
+                       "pid": pid}, fh)
+
+    def squatter_got_a_connection():
+        try:
+            c, _ = squatter.accept()
+        except TimeoutError:
+            return False
+        c.close()
+        return True
+
+    try:
+        endpoint(_dead_pid())
+        with pytest.raises(ConnectionRefusedError):
+            transport.connect(ep, timeout=5)
+        assert not squatter_got_a_connection()
+
+        # Alive, but (as Windows' port table can tell) not the one listening.
+        endpoint(os.getpid())
+        monkeypatch.setattr(transport, "_tcp_listeners",
+                            lambda: [(port, os.getpid() + 1, "127.0.0.1")])
+        with pytest.raises(ConnectionRefusedError):
+            transport.connect(ep, timeout=5)
+        assert not squatter_got_a_connection()
+
+        # The table naming the writer as the listener: connect goes ahead.
+        monkeypatch.setattr(transport, "_tcp_listeners",
+                            lambda: [(port, os.getpid(), "127.0.0.1")])
+        transport.connect(ep, timeout=5).close()
+        assert squatter_got_a_connection()
+    finally:
+        squatter.close()
+
+
 def test_connections_beyond_the_cap_are_turned_away_not_queued_forever(
         short_runtime_dir, transport_kind, monkeypatch):
     """One thread per connection, each living as long as its client. Unbounded,

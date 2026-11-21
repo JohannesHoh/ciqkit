@@ -1,6 +1,7 @@
 """WP4: ciqkit.toml, precedence, `sim shots`. Fakes only (no sim, SDK, display)."""
 import json
 import logging
+import os
 import sys
 
 import pytest
@@ -229,7 +230,7 @@ def test_shots_all_submits_one_job_per_screen(proj, fake, capsys):
     assert _kinds(home) == [ChunkKind.LOAD, ChunkKind.SHOT]
     assert home.chunks[0].args["anchor"] == ["12:00"]
     assert home.chunks[0].args["force"] is True
-    assert home.chunks[1].args["out_dir"] == "/o"
+    assert home.chunks[1].args["out_dir"] == os.path.abspath("/o")   # D:\o on Windows
     assert _kinds(st) == [ChunkKind.SEED, ChunkKind.LOAD, ChunkKind.REACH,
                           ChunkKind.SHOT, ChunkKind.RESTORE]
     assert st.chunks[0].args["consts"] == {"SEED_DEMO": "true", "SEED_PAGE": "2"}

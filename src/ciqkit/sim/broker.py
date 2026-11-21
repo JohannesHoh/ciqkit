@@ -23,8 +23,8 @@ The control socket is a command channel -- see SECURITY.md and
 from __future__ import annotations
 
 import dataclasses
+import errno
 import logging
-import math
 import os
 import socket
 import sys
@@ -36,7 +36,7 @@ from . import protocol as proto
 from . import seedjournal
 from . import transport
 from .._compat import open_lock_file, try_lock
-from .protocol import Job, Chunk, ChunkKind, JobState, Op
+from .protocol import Job, Chunk, ChunkKind, JobState, Op, wait_timeout_error
 from .session import SimSession, SimError
 from .. import leases as leaselib
 
@@ -92,6 +92,17 @@ MAX_LINE = 1024 * 1024
 # the Toolhelp tree walk are slower there, and that has not been measured on a
 # real build yet.
 BUDGET_MARGIN_S = 10.0 if sys.platform == "win32" else 5.0
+# Connections that failed the TCP token check and are being answered. A refusal
+# lingers up to ~0.5 s (see _refuse), after the connection has left the
+# listener's pre-auth pool, so without its own bound a flood of bad
+# connections keeps one thread and one fd each: EMFILE, or no threads left.
+# Past this, a failed connection is closed without an answer.
+_REFUSE_SLOTS = threading.BoundedSemaphore(8)
+# accept() errors that mean "out of a resource right now", not "the listening
+# socket is broken": wait and keep serving.
+_ACCEPT_RETRY = frozenset(getattr(errno, n) for n in (
+    "EMFILE", "ENFILE", "ENOBUFS", "ENOMEM", "ECONNABORTED", "EPROTO", "EINTR",
+    "EAGAIN", "WSAEMFILE", "WSAECONNRESET", "WSAENOBUFS") if hasattr(errno, n))
 
 log = logging.getLogger("ciqkit.sim.broker")
 
@@ -1013,12 +1024,10 @@ class Broker:
                 self.cond.notify_all()
             return {"ok": True, "job_id": job.id}
         if op == Op.WAIT:
-            timeout_s = req.get("timeout_s", 600)
-            # bool is an int subclass; True is not a timeout anyone meant.
-            if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
-                    or not math.isfinite(timeout_s)):
-                return _bad("wait timeout_s must be a finite number")
-            return self._wait(req["job_id"], float(timeout_s))
+            t = req.get("timeout_s", 600)
+            if (e := wait_timeout_error(t)) is not None:
+                return _bad(e)
+            return self._wait(req["job_id"], float(t))
         if op == Op.STATUS:
             with self.lock:
                 jobs = [self._job_brief(j) for j in self.jobs.values()]
@@ -1303,18 +1312,38 @@ def serve(sock_path: str | None = None):
                 conn, _ = srv.accept()
             except TimeoutError:
                 continue
-            # Bounded: a connection thread lives as long as its client keeps
-            # the socket open (up to an hour), so one client in a reconnect
-            # loop could otherwise pile up threads until the process died.
-            # Turning the excess away with an error beats falling over.
-            if not _CONN_SLOTS.acquire(blocking=False):
-                log.warning("refusing a connection: all %d handler slots are "
-                            "busy", MAX_CONNS)
-                _refuse(conn, proto.error_reply(
-                    proto.E_BUSY, "broker is out of connection slots; retry shortly"))
+            except OSError as e:
+                if e.errno not in _ACCEPT_RETRY:
+                    raise
+                # Out of fds (or the peer vanished): this must not stop the
+                # daemon, whose jobs are still running. Back off so the
+                # threads that hold the fds can finish and free them.
+                log.warning("accept failed (%s); retrying", e)
+                time.sleep(0.1)
                 continue
-            threading.Thread(target=_handle_conn, args=(broker, conn, listener),
-                             daemon=True).start()
+            if listener.token is not None:
+                # TCP: anyone local can connect, so a connection takes a
+                # handler slot only once it has shown the token (see
+                # _handle_conn). Until then it sits in the listener's small
+                # pre-auth pool, which evicts its oldest member when full.
+                listener.admit(conn)
+            elif not _take_slot(conn):
+                continue
+            try:
+                threading.Thread(target=_handle_conn, args=(broker, conn, listener),
+                                 daemon=True).start()
+            except RuntimeError:
+                # Cannot start a thread: give back what this connection holds
+                # rather than let the error end the accept loop.
+                log.warning("could not start a handler thread; dropping a connection")
+                listener.forget(conn)
+                if listener.token is None:
+                    _CONN_SLOTS.release()
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                time.sleep(0.1)
     finally:
         broker._stop = True
         with broker.cond:
@@ -1339,6 +1368,22 @@ def serve(sock_path: str | None = None):
         while broker._requests_in_flight and time.time() < deadline:
             time.sleep(0.02)
         print("[ciqsimd] stopped", file=sys.stderr)
+
+
+def _take_slot(conn: socket.socket) -> bool:
+    """Take a handler slot for ``conn``, or answer and close it.
+
+    Bounded: a connection thread lives as long as its client keeps the socket
+    open (up to an hour), so one client in a reconnect loop could otherwise
+    pile up threads until the process died. Turning the excess away with an
+    error beats falling over.
+    """
+    if _CONN_SLOTS.acquire(blocking=False):
+        return True
+    log.warning("refusing a connection: all %d handler slots are busy", MAX_CONNS)
+    _refuse(conn, proto.error_reply(
+        proto.E_BUSY, "broker is out of connection slots; retry shortly"))
+    return False
 
 
 def _refuse(conn: socket.socket, resp: dict) -> None:
@@ -1369,28 +1414,35 @@ def _refuse(conn: socket.socket, resp: dict) -> None:
 
 def _handle_conn(broker: Broker, conn: socket.socket,
                  listener: transport.Listener | None = None):
-    """Serve one client connection: JSON lines in, JSON lines out."""
-    conn.settimeout(3600)
+    """Serve one client connection: JSON lines in, JSON lines out.
+
+    On a unix socket the accept loop already took this connection's handler
+    slot; on TCP it is taken here, after the token (see serve()).
+    """
+    slotted = listener is None or listener.token is None
     try:
         with conn:
-            f = conn.makefile("rb")
-            if listener is not None:
+            if not slotted:
                 # Nothing a connection sends is looked at until it has proved
-                # it may talk to us. Short deadline: an unauthenticated peer
-                # must not hold a handler slot for an hour.
-                conn.settimeout(10)
-                if not listener.authenticate(f):
+                # it may talk to us, under one absolute deadline for the whole
+                # auth line (Listener.authenticate).
+                if not listener.authenticate(conn):
                     log.warning("refused a connection that did not authenticate")
-                    f.close()
-                    _refuse(conn, proto.error_reply(proto.E_UNAUTHORIZED, "unauthorized"))
+                    if _REFUSE_SLOTS.acquire(blocking=False):
+                        try:
+                            _refuse(conn, proto.error_reply(proto.E_UNAUTHORIZED, "unauthorized"))
+                        finally:
+                            _REFUSE_SLOTS.release()
+                    return      # `with conn` closes it, unanswered
+                if not _take_slot(conn):
                     return
-                conn.settimeout(3600)
+                slotted = True
+            conn.settimeout(3600)
+            f = conn.makefile("rb")
             while True:
-                # Bounded read: `for line in f` buffers until a newline, however
-                # far away, so one peer could make this thread hold any amount
-                # of memory. A line longer than MAX_LINE is refused and the
-                # connection dropped -- its tail is not a request boundary we
-                # could resynchronise on.
+                # Capped, and read no further than the cap: an unbounded
+                # readline lets one connection make the daemon buffer a line
+                # of any size.
                 line = f.readline(MAX_LINE + 1)
                 if not line:
                     break
@@ -1427,7 +1479,8 @@ def _handle_conn(broker: Broker, conn: socket.socket,
     except Exception:
         log.exception("a connection handler failed")
     finally:
-        _CONN_SLOTS.release()
+        if slotted:
+            _CONN_SLOTS.release()
 
 
 if __name__ == "__main__":
