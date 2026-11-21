@@ -1449,7 +1449,9 @@ def test_a_test_batch_shares_one_budget_between_build_and_tests(tmp_path):
     # The tests get what the build LEFT, not max_s afresh: the time the build
     # really took plus the tests' budget stays inside the chunk, with the margin
     # to spare for the worker join.
-    assert fake.build_s + tests_t <= tb.max_s - broker_mod.BUDGET_MARGIN_S + 1e-6
+    # 0.02 s slack: Windows' clock ticks in ~15.6 ms, so a 0.3 s build can be
+    # measured as 0.297 s and leave the tests that much more.
+    assert fake.build_s + tests_t <= tb.max_s - broker_mod.BUDGET_MARGIN_S + 0.02
     assert tests_t < tb.max_s - fake.build_s
 
 

@@ -4,6 +4,7 @@ mistyped command from doing something surprising.
 None of this touches the simulator.
 """
 
+import os
 import sys
 import json
 
@@ -523,7 +524,8 @@ def test_broker_candidates_lead_with_env_override(monkeypatch):
 
     monkeypatch.setenv("CIQKIT_PYTHON", "/opt/some/python")
     cands = client.broker_python_candidates()
-    assert cands[0] == "/opt/some/python"
+    # abspath: on Windows a rooted path without a drive is on the current drive.
+    assert cands[0] == os.path.abspath("/opt/some/python")
     assert sys.executable in cands
 
 

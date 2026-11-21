@@ -51,7 +51,14 @@ def test_a_relative_ciqkit_python_is_anchored_at_the_callers_cwd(tmp_path, monke
     first = client.broker_python_candidates()[0]
     assert first == os.path.join(str(tmp_path), ".venv", "bin", "python")
     monkeypatch.setenv("CIQKIT_PYTHON", "python3")
-    assert client.broker_python_candidates()[0] == "python3"
+    if os.name == "nt":
+        # A bare name is resolved on PATH (never the cwd) up front on Windows.
+        from ciqkit._compat import which_no_cwd
+        found = which_no_cwd("python3")
+        cands = client.broker_python_candidates()
+        assert (cands[0] == found) if found else ("python3" not in cands)
+    else:
+        assert client.broker_python_candidates()[0] == "python3"
 
 
 @posix_only
