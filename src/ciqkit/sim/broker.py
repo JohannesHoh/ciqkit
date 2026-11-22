@@ -32,6 +32,7 @@ import threading
 import time
 import traceback
 
+from . import preflight
 from . import protocol as proto
 from . import seedjournal
 from . import transport
@@ -337,6 +338,18 @@ class Broker:
                 job.mark_running()
                 if job.started is None:
                     job.started = time.time()
+                    # Once per job: the level cannot change what a job sees
+                    # mid-run, and it must stay cheap and never throw.
+                    try:
+                        v = preflight.pressure_verdict(preflight.memory_pressure())
+                    except Exception:
+                        v = None
+                    if v and v[0] == "fail":
+                        self._fail(job, v[1])
+                        self.cond.notify_all()
+                        continue
+                    if v:
+                        job.warnings.append(v[1])
                 self._last_job_id = job.id
                 self._rewind_locked(job)
                 chunk = job.chunks[job.chunk_ix]
@@ -1116,7 +1129,7 @@ class Broker:
 
     def _job_full(self, j: Job) -> dict:
         d = self._job_brief(j)
-        d.update({"results": j.results, "error": j.error,
+        d.update({"results": j.results, "error": j.error, "warnings": j.warnings,
                   "started": j.started, "finished": j.finished})
         return d
 

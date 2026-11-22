@@ -340,7 +340,8 @@ class _SimWindow:
     """
     __slots__ = ("left", "top", "width", "height",
                  "content_left", "content_top", "content_w", "content_h",
-                 "retina_scale", "geometry_captured", "display_box")
+                 "retina_scale", "geometry_captured", "display_box",
+                 "occluded_by", "grab_mode")
 
     def __init__(self, left: int, top: int, width: int, height: int):
         self.left = left
@@ -357,6 +358,8 @@ class _SimWindow:
         self.retina_scale = 1.0
         self.geometry_captured = False
         self.display_box = None
+        self.occluded_by = []    # covers seen at the last grab (see capture_window)
+        self.grab_mode = None    # "window" | "region" | "screencapture"
 
     def rect(self):
         return (self.left, self.top, self.width, self.height)
@@ -1264,6 +1267,94 @@ def _quartz_region_png(x: int, y: int, w: int, h: int, path: str) -> bool:
         return False
 
 
+class OccludedError(RuntimeError):
+    """The simulator window is covered and the grab could only read the screen."""
+
+
+#: Windows found covering the simulator since the last drain. Like
+#: ``_DISMISSED``: a cover must never vanish silently, the session attaches it
+#: to the shot/nav/load result.
+_OCCLUDED: list = []
+
+
+def note_occluded(occ) -> None:
+    for o in occ or []:
+        key = (o.get("owner"), o.get("title"))
+        if not any((e.get("owner"), e.get("title")) == key for e in _OCCLUDED):
+            _OCCLUDED.append(dict(o))
+    if occ:
+        log.warning("simulator window is covered by %s", _sw.describe_occluders(occ))
+
+
+def peek_occluders() -> list:
+    return list(_OCCLUDED)
+
+
+def drain_occluders() -> list:
+    out = list(_OCCLUDED)
+    del _OCCLUDED[:]
+    return out
+
+
+def _mac_window_infos(option, wid=None) -> list:
+    """CGWindowListCopyWindowInfo as a list of dicts; [] on any failure."""
+    try:
+        import Quartz
+        r = Quartz.CGWindowListCopyWindowInfo(
+            option, Quartz.kCGNullWindowID if wid is None else wid)
+        return list(r or [])
+    except Exception:
+        return []
+
+
+def _mac_display_sizes() -> list:
+    """(w, h) of every active display; [] when unreadable."""
+    try:
+        import Quartz
+        err, ids, _n = Quartz.CGGetActiveDisplayList(16, None, None)
+        return [(Quartz.CGDisplayBounds(d).size.width, Quartz.CGDisplayBounds(d).size.height)
+                for d in ids] if err == 0 else []
+    except Exception:
+        return []
+
+
+def _mac_sim_window_id(rect):
+    """(window id | None, occluders) for the simulator window at ``rect``.
+
+    The id is what lets the grab read the window's own drawing; the occluders
+    are the on-screen windows above it that cover a meaningful part of it.
+    Never raises: any Quartz failure is (None, [])."""
+    try:
+        import Quartz
+        infos = _mac_window_infos(Quartz.kCGWindowListOptionOnScreenOnly)
+        wid = _sw.pick_window_id(infos, rect)
+        if wid is None:
+            return None, []
+        above = _mac_window_infos(Quartz.kCGWindowListOptionOnScreenAboveWindow, wid)
+        return wid, _sw.find_occluders(above, rect, displays=_mac_display_sizes())
+    except Exception:
+        return None, []
+
+
+def _quartz_window_png(wid: int, x: int, y: int, w: int, h: int, path: str) -> bool:
+    """Grab ONE window's own drawing (never other windows over it) to a PNG.
+    False on any failure or an empty image."""
+    try:
+        import Quartz
+        from Foundation import NSURL
+        img = Quartz.CGWindowListCreateImage(
+            Quartz.CGRectMake(x, y, w, h), Quartz.kCGWindowListOptionIncludingWindow,
+            wid, Quartz.kCGWindowImageBoundsIgnoreFraming)
+        if img is None or Quartz.CGImageGetWidth(img) == 0:
+            return False
+        dest = Quartz.CGImageDestinationCreateWithURL(
+            NSURL.fileURLWithPath_(path), "public.png", 1, None)
+        Quartz.CGImageDestinationAddImage(dest, img, None)
+        return bool(Quartz.CGImageDestinationFinalize(dest))
+    except Exception:
+        return False
+
+
 def capture_window(hwnd, *, grab_settle_s: float | None = None,
                    refocus: bool = True):
     """Capture the simulator window.  Returns (PIL Image, dpi_scale).
@@ -1330,7 +1421,23 @@ def capture_window(hwnd, *, grab_settle_s: float | None = None,
             # answered in ~16 ms), which failed every load verification with
             # "pre-push baseline frame could not be captured". Same pixels:
             # an on-screen region grab at native (Retina) resolution.
-            if not _quartz_region_png(x, y, w, h, tmp_path):
+            wid, occluders = _mac_sim_window_id((x, y, w, h))
+            hwnd.occluded_by = occluders
+            note_occluded(occluders)
+            if wid is not None and _quartz_window_png(wid, x, y, w, h, tmp_path):
+                hwnd.grab_mode = "window"
+            elif occluders:
+                # Only the on-screen region can be read now, and it WOULD show
+                # whatever covers the window (2026-11-19: the macOS out-of-
+                # memory dialog in every capture). Refuse, naming the cover.
+                top = occluders[0]
+                raise OccludedError(
+                    f"simulator window is covered by {top['owner']}: {top['title']} "
+                    f"-- the shot would contain it")
+            elif _quartz_region_png(x, y, w, h, tmp_path):
+                hwnd.grab_mode = "region"
+            else:
+                hwnd.grab_mode = "screencapture"
                 proc = subprocess.run(
                     ["screencapture", "-x", "-R", f"{x},{y},{w},{h}", tmp_path],
                     capture_output=True,

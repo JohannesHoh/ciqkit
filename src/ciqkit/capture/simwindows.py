@@ -290,3 +290,116 @@ def parse_fit_state(text: str) -> dict:
             elif v.lower().endswith((".fit", ".gpx")):
                 out["file"] = v
     return out
+
+
+# ── window-server records (macOS CGWindowListCopyWindowInfo) ────────────────
+#
+# A region grab reads whatever is on screen at that rect, so another app's
+# window over the simulator ends up in the PNG (2026-11-19: macOS's "out of
+# application memory" panel sat on top of every capture for hours). These pure
+# helpers pick the simulator's own window id -- which lets the grab read that
+# window's drawing alone -- and name whatever is covering it.
+
+#: An overlap counts when it is at least this fraction of the window AND this
+#: many logical px^2. Below that it is a sliver (a cursor-sized overlay, a
+#: shadow edge) that cannot hide the watch screen.
+OCCLUDER_MIN_FRAC = 0.01
+OCCLUDER_MIN_AREA = 400.0
+
+
+def _bounds(info: dict):
+    b = info.get("kCGWindowBounds") or {}
+    try:
+        return (float(b["X"]), float(b["Y"]), float(b["Width"]), float(b["Height"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def pick_window_id(infos, rect, owner: str = "simulator", tol: float = 3.0):
+    """The CGWindowID of the simulator's device window, or None.
+
+    ``rect`` is the (x, y, w, h) of the window ``find_sim_window`` found; the
+    match is owner name plus bounds within ``tol`` px, normal layer only, so it
+    is the same window and not an aux panel. Several candidates: the one titled
+    like the device window wins, then the closest bounds.
+    """
+    x, y, w, h = rect
+    best = None
+    best_key = None
+    for info in infos or []:
+        if owner.lower() not in str(info.get("kCGWindowOwnerName", "")).lower():
+            continue
+        if info.get("kCGWindowLayer", 0) != 0:
+            continue
+        b = _bounds(info)
+        wid = info.get("kCGWindowNumber")
+        if b is None or wid is None:
+            continue
+        dist = max(abs(b[0] - x), abs(b[1] - y), abs(b[2] - w), abs(b[3] - h))
+        if dist > tol:
+            continue
+        titled = str(info.get("kCGWindowName", "")).startswith(DEVICE_TITLE_PREFIX)
+        key = (not titled, dist)
+        if best_key is None or key < best_key:
+            best, best_key = int(wid), key
+    return best
+
+
+def find_occluders(infos_above, rect, min_frac: float = OCCLUDER_MIN_FRAC,
+                   min_area: float = OCCLUDER_MIN_AREA,
+                   displays=()) -> list[dict]:
+    """Windows from ``infos_above`` (on screen, above the simulator window)
+    that cover a meaningful part of ``rect``: ``[{owner, title, area}]``,
+    biggest overlap first. Invisible (alpha 0), empty and sliver-sized windows
+    are ignored."""
+    x, y, w, h = rect
+    total = max(w * h, 1.0)
+    out = []
+    # The Dock and Notification Center each keep a transparent window the size
+    # of the whole display above everything (measured macOS 26); it hides
+    # nothing. A real alert or banner is never display-sized.
+    for info in infos_above or []:
+        try:
+            if float(info.get("kCGWindowAlpha", 1.0)) <= 0.01:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if info.get("kCGWindowIsOnscreen") is False:
+            continue
+        b = _bounds(info)
+        if b is None or b[2] <= 0 or b[3] <= 0:
+            continue
+        if info.get("kCGWindowLayer", 0) != 0 and any(
+                b[2] >= dw - 2 and b[3] >= dh - 2 for dw, dh in displays):
+            continue
+        ix = min(x + w, b[0] + b[2]) - max(x, b[0])
+        iy = min(y + h, b[1] + b[3]) - max(y, b[1])
+        if ix <= 0 or iy <= 0:
+            continue
+        area = ix * iy
+        if area < min_area or area / total < min_frac:
+            continue
+        out.append({"owner": str(info.get("kCGWindowOwnerName", "") or "?"),
+                    "title": str(info.get("kCGWindowName", "") or ""),
+                    "area": round(area)})
+    out.sort(key=lambda o: -o["area"])
+    return out
+
+
+def describe_occluders(occ) -> str:
+    """``Owner: title, Owner2`` for a warning or error message."""
+    return ", ".join(o["owner"] + (f": {o['title']}" if o.get("title") else "")
+                     for o in occ)
+
+
+# ── memory pressure ─────────────────────────────────────────────────────────
+PRESSURE_NORMAL, PRESSURE_WARN, PRESSURE_CRITICAL = 1, 2, 4
+
+
+def parse_pressure(text) -> int | None:
+    """``kern.memorystatus_vm_pressure_level`` output -> 1/2/4, else None."""
+    try:
+        v = int(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v in (1, 2, 4) else None

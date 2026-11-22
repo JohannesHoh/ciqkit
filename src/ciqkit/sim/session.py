@@ -50,6 +50,14 @@ log = logging.getLogger("ciqkit.sim")
 _SDK_RES_CACHE: dict = {}
 
 
+def _attach_occluded(r: dict, occ: list) -> None:
+    """``occluded_by`` + a readable warning on a step/shot/load result."""
+    r["occluded_by"] = occ
+    r.setdefault("warnings", []).append(
+        "simulator window was covered by " + su._sw.describe_occluders(occ)
+        + " (the capture read the window's own drawing, or was refused)")
+
+
 def _with_dismissed(fn):
     """Attach what the dialog/window dismisser did during ``fn`` to its result.
 
@@ -62,10 +70,14 @@ def _with_dismissed(fn):
     @functools.wraps(fn)
     def wrapper(self, *a, **kw):
         su.drain_dismissed()                 # events from before this call
+        su.drain_occluders()
         try:
             r = fn(self, *a, **kw)
         finally:
             ev = su.drain_dismissed()
+            occ = su.drain_occluders()
+        if occ and isinstance(r, dict):
+            _attach_occluded(r, occ)
         if ev and isinstance(r, dict):
             r["dismissed"] = ev
             if any(e.get("kind") == "simulator_crash_dialog" for e in ev):
@@ -173,8 +185,11 @@ class SimSession:
         # scope as the loop that calls this.
         if not self._hwnd:
             self._rebind()
-        img, _scale = su.capture_window(self._hwnd, grab_settle_s=grab_settle_s,
-                                        refocus=refocus)
+        try:
+            img, _scale = su.capture_window(self._hwnd, grab_settle_s=grab_settle_s,
+                                            refocus=refocus)
+        except su.OccludedError as exc:
+            raise SimError(str(exc)) from exc
         return img
 
     # ── build (minimal; caller may pre-build instead) ──────────────────────────
@@ -205,6 +220,7 @@ class SimSession:
         return _builder.build(app_dir, device, timeout_s, build_cmd, tests)
 
     # ── load + verify ──────────────────────────────────────────────────────────
+    @_with_dismissed
     def load(self, app: str, prg: str, device: str = DEFAULT_DEVICE,
              project: str | None = None, force: bool = False,
              max_attempts: int = 3, anchor=None,
@@ -307,6 +323,12 @@ class SimSession:
                 self.restart()
                 before_sig = self._safe_sig()
         self.current = None
+        cover = su.peek_occluders()
+        if cover:
+            raise SimError(
+                f"app {app} did not load after {max_attempts} attempts; the "
+                f"simulator window was covered by {su._sw.describe_occluders(cover)}"
+                f" meanwhile, which can hide the screen. Dismiss it and retry.")
         if before_sig is None:
             raise SimError(
                 f"app {app} did not load after {max_attempts} attempts, and the "
@@ -1013,8 +1035,12 @@ class SimSession:
                           marker_regex=bool(step.get("regex", False)))
         except SimError as exc:
             return {"ok": False, "reason": str(exc)}
-        return {"ok": True, "path": r["path"], "line": r.get("marker_line"),
-                "anchor": r.get("anchor")}
+        out = {"ok": True, "path": r["path"], "line": r.get("marker_line"),
+               "anchor": r.get("anchor")}
+        if r.get("occluded_by"):
+            out["occluded_by"] = r["occluded_by"]
+            out["warnings"] = r.get("warnings", [])
+        return out
 
     # ── screenshot ─────────────────────────────────────────────────────────────
     @_with_dismissed

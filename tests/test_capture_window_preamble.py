@@ -89,6 +89,7 @@ def mac(monkeypatch, tmp_path):
     # these tests exercise; test_quartz_grab_skips_the_cli covers the other.
     monkeypatch.setattr(su, "_quartz_region_png", lambda *_a: False)
     monkeypatch.setattr(su, "_park_pointer", lambda _w: None)
+    monkeypatch.setattr(su, "_mac_sim_window_id", lambda _r: (None, []))
     calls.probe_result = probe_result
     calls.regions = regions
     return calls

@@ -219,3 +219,34 @@ def reset():
     """Testing hook — clear the memoized result."""
     global _done, _result
     _done, _result = False, None
+
+
+def memory_pressure() -> int | None:
+    """macOS memory-pressure level: 1 normal, 2 warn, 4 critical; None when it
+    cannot be read (non-macOS, sysctl missing or odd output). Cheap (~5 ms) and
+    never raises -- an unreadable level means "no check", not a failed job."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        r = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                           capture_output=True, text=True, timeout=2)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    from ..capture.simwindows import parse_pressure
+    return parse_pressure(r.stdout)
+
+
+def pressure_verdict(level) -> tuple[str, str] | None:
+    """(``"fail"`` | ``"warn"``, message) for a pressure level, or None."""
+    if level == 4:
+        return ("fail", "macOS memory pressure is CRITICAL: the system may show "
+                "its 'out of application memory' dialog over the simulator "
+                "and the job's screens would be unusable. Quit memory-heavy "
+                "apps and retry.")
+    if level == 2:
+        return ("warn", "macOS memory pressure is elevated (warn): the "
+                "'out of application memory' dialog may appear over the "
+                "simulator; check shots for it.")
+    return None

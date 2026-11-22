@@ -54,3 +54,12 @@ def short_runtime_dir(monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", base)
     yield base
     shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def no_real_memory_pressure(monkeypatch):
+    """The broker reads macOS memory pressure at job start; a loaded dev
+    machine must not fail unrelated scheduler tests. Tests of the check itself
+    patch it again."""
+    from ciqkit.sim import preflight
+    monkeypatch.setattr(preflight, "memory_pressure", lambda: None)

@@ -586,8 +586,16 @@ app not running.
 
 ## Known limits
 
-* Capture on macOS is a screen-region grab: the simulator window must stay
-  unobscured. (Windows reads the window's own drawing; covering it is fine.)
+* Capture on macOS reads the simulator window's own drawing by window id, so
+  a window over it (even macOS's "out of application memory" panel) is not in
+  the image; both platforms are immune to covers. Only when the window id
+  cannot be found, or the grab comes back empty, does it fall back to an
+  on-screen region grab -- and then a cover fails the shot ("simulator window is
+  covered by <owner>: <title>"). Covers are reported as `occluded_by` + a
+  warning on shot/nav/load results (display-sized Dock/Notification Center
+  hosts and slivers are ignored). The broker also reads
+  `kern.memorystatus_vm_pressure_level` per job: critical fails it, warn adds
+  a `warnings` entry on the job.
 * An app whose first screen is pixel-identical to the watchface behind it
   cannot be told apart by the frame diff.
 * **macOS: a cold push of an unchanged build costs one simulator restart.** If the

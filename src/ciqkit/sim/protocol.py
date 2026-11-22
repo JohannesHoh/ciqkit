@@ -128,6 +128,7 @@ class Job:
     chunk_ix: int = 0                 # next chunk to run (resume point on preempt)
     results: list = field(default_factory=list)   # per-chunk result dicts
     error: str | None = None
+    warnings: list = field(default_factory=list)   # daemon notes (memory pressure)
     # Aging clock. `waiting_since` is when the current waiting spell began, or
     # None while the job holds the simulator; `waited_total` is the seconds
     # accumulated over previous spells. Aging is measured from these rather

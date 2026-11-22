@@ -18,6 +18,20 @@ has, install from a clone (`pip install -e ".[sim]"`).
 
 ### Added
 
+* macOS capture reads the simulator window's own drawing
+  (`CGWindowListCreateImage` with the window id) instead of an on-screen
+  region, so another app's window over the simulator can no longer end up in
+  a shot (2026-11-19: macOS's "out of application memory" dialog was in every
+  capture for hours and nothing said so). The region grab and `screencapture`
+  remain as fallbacks. Windows above the simulator that cover a meaningful part
+  of it are reported as `occluded_by` plus a warning on shot, nav and load
+  results; if only the fallback grab is possible and something covers the
+  window, the shot fails with "simulator window is covered by <owner>: <title>
+  -- the shot would contain it".
+* The broker reads macOS memory pressure once at job start: critical fails the
+  job fast naming the out-of-memory dialog risk, warn adds a job `warnings`
+  entry. Unreadable means no check.
+
 * `fuzz/`: Atheris harnesses for the broker's control-channel SUBMIT path and
   the simulator test-output parser, run by `.github/workflows/fuzz.yml`
   (60 s per push, 10 min weekly). `tests/test_fuzz_targets.py` replays the
