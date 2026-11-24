@@ -111,6 +111,32 @@ def broker_install_check(reply: dict, own_install: str) -> dict | None:
                   f"{own_install}; run `ciqkit sim shutdown` to start this one")
 
 
+def _preflight() -> dict:
+    """The broker's preflight when it runs as ciqkit.app, else this process's own.
+
+    macOS judges each by its own name: a terminal without the permission says
+    nothing about ciqkit.app, and the other way round."""
+    from . import macapp
+    from .sim import preflight
+    if not macapp.installed_for_me():
+        return preflight.check_once()
+    from .sim.client import Client
+    try:
+        rep = Client().preflight()
+    except (RuntimeError, OSError) as exc:
+        raise preflight.PreflightError(f"the broker did not answer: {exc}") from exc
+    if not rep.get("passed"):
+        raise preflight.PreflightError(rep.get("error") or "preflight failed")
+    warnings = list(rep.get("warnings", []))
+    if not rep.get("as_app"):
+        warnings.append("the running broker was started without ciqkit.app")
+    if rep.get("screen_recording") is False:
+        raise preflight.PreflightError(
+            "macOS Screen Recording is not allowed for ciqkit: System Settings > "
+            "Privacy & Security > Screen & System Audio Recording.")
+    return {"warnings": warnings}
+
+
 def _environment_checks(checks: list) -> None:
     import platform
     from .sim import preflight
@@ -173,7 +199,7 @@ def _environment_checks(checks: list) -> None:
 
     preflight.reset()
     try:
-        res = preflight.check_once()
+        res = _preflight()
         checks.append(_check("simulator", "ok", "preflight OK",
                              [f"  warning: {w}" for w in res.get("warnings", [])]))
     except preflight.PreflightError as exc:

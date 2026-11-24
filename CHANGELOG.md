@@ -18,6 +18,11 @@ has, install from a clone (`pip install -e ".[sim]"`).
 
 ### Added
 
+* macOS: `ciqkit mac-app install` builds a small background app the broker runs
+  through, so macOS lists `ciqkit` itself under Accessibility and Screen
+  Recording instead of the terminal, `node` or `Python` that happened to start
+  it. Opt-in. `ciqkit mac-app status` and `ciqkit doctor` then report what macOS
+  allows the broker, not the calling shell.
 * macOS capture reads the simulator window's own drawing
   (`CGWindowListCreateImage` with the window id) instead of an on-screen
   region, so another app's window over the simulator can no longer end up in

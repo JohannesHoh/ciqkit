@@ -23,6 +23,7 @@ the daemon is running, and the next job must see the fix.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -160,7 +161,13 @@ def _check_accessibility(warnings):
         return
     probe = ('tell application "System Events" to get size of '
              'front window of (first process whose frontmost is true)')
-    r = subprocess.run(["osascript", "-e", probe], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["osascript", "-e", probe], capture_output=True, text=True,
+                           timeout=60)
+    except subprocess.TimeoutExpired:
+        raise PreflightError(
+            "macOS did not answer within 60 s whether ciqkit may control windows; "
+            "a permission dialog may be waiting on the Mac's screen.") from None
     err = (r.stderr or "")
     if "-25211" in err or "not allowed assistive access" in err.lower():
         raise PreflightError(
@@ -168,8 +175,12 @@ def _check_accessibility(warnings):
             "  Window control and taps will silently fail, and the symptom looks\n"
             "  exactly like 'the simulator did not start'.\n"
             "  Grant it: System Settings -> Privacy & Security -> Accessibility.\n"
-            "  Enable BOTH the terminal or editor that runs this process AND\n"
-            "  /usr/bin/osascript, then fully quit and reopen that app.")
+            + ("  Switch on ciqkit there."
+               if os.environ.get("CIQKIT_APP") == "1" else
+               "  Enable BOTH the terminal or editor that runs this process AND\n"
+               "  /usr/bin/osascript, then fully quit and reopen that app.\n"
+               "  Or run `ciqkit mac-app install`, so ciqkit is listed by its own "
+               "name."))
     # Any other rc (e.g. no front window right now) is not an Accessibility fail.
 
 
@@ -213,6 +224,30 @@ def check_once() -> dict:
     for w in warnings:
         print(f"[ciqkit preflight] WARN: {w}", file=sys.stderr)
     return _result
+
+
+def report(request: bool = False) -> dict:
+    """The preflight verdict for THIS process, plus macOS' own permission answers.
+
+    Always fresh: someone asking wants to know whether the switch they just
+    flipped has taken."""
+    out = {"ok": True, "as_app": os.environ.get("CIQKIT_APP") == "1"}
+    if sys.platform == "darwin":
+        from .. import macperm_cli
+        argv = [sys.executable, "-I", "-m", macperm_cli.__name__]
+        try:
+            r = subprocess.run(argv + (["--request"] if request else []),
+                               capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL)
+            out.update(json.loads(r.stdout))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    reset()
+    try:
+        out.update(passed=True, warnings=check_once().get("warnings", []))
+    except PreflightError as exc:
+        out.update(passed=False, error=str(exc))
+    return out
 
 
 def reset():

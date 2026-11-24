@@ -143,6 +143,11 @@ class Client:
     def ping(self) -> dict:
         return _check(self._rpc({"op": proto.Op.PING}))
 
+    def preflight(self, request: bool = False) -> dict:
+        """What the BROKER may do; ``request`` has macOS list it in its settings."""
+        return _check(self._rpc({"op": proto.Op.PREFLIGHT, "request": request},
+                                read_timeout=100.0))
+
     def submit(self, job: Job) -> str:
         r = self._rpc({"op": proto.Op.SUBMIT, "job": job.to_dict()})
         if proto.error_code(r) == proto.E_SHUTTING_DOWN:
@@ -356,6 +361,18 @@ def spawn_daemon(sock_path: str | None = None):
     # whole life -- long after the real holder exited -- and an unmigrated
     # script could then drive the simulator alongside it.
     env.pop(LEASE_ENV_KEY, None)
+    env.pop("CIQKIT_APP", None)
+    # macOS, opt-in: through ciqkit.app the broker has its own name in the
+    # privacy settings (see ciqkit.macapp). An explicit CIQKIT_PYTHON wins.
+    from .. import macapp
+    if not os.environ.get("CIQKIT_PYTHON") and macapp.installed_for_me():
+        try:
+            macapp.launch(env, log_path)
+            return
+        except macapp.AppError as exc:
+            with open(log_path, "a") as f:
+                f.write(f"[client] ciqkit.app did not start ({exc}); "
+                        "starting the broker without it\n")
     python = resolve_broker_python()
     logf = open(log_path, "a")
     if python is None:

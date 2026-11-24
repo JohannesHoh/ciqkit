@@ -22,6 +22,7 @@ commands:
   new          create a new Connect IQ project from a template
   init         wire an existing project up for ciqkit (dry run unless --write)
   keygen       create the developer key used by the built-in build
+  mac-app      macOS: give the broker its own name in the privacy settings
   doctor       check that the environment can actually drive the simulator
 
 Run `ciqkit <command> --help` for the options of each command.
@@ -41,6 +42,7 @@ _COMMANDS = {
     "keygen": ("ciqkit.keygen_cli", None),
     "new": ("ciqkit.new_cli", None),
     "init": ("ciqkit.init_cli", None),
+    "mac-app": ("ciqkit.macapp_cli", None),
     "doctor": (None, None),
 }
 

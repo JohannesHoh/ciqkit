@@ -995,7 +995,13 @@ class Broker:
             return {"ok": True, "pid": os.getpid(),
                     "uptime_s": time.time() - _START,
                     "version": ciqkit.__version__,
-                    "install": os.path.dirname(os.path.abspath(ciqkit.__file__))}
+                    "install": os.path.dirname(os.path.abspath(ciqkit.__file__)),
+                    "as_app": os.environ.get("CIQKIT_APP") == "1"}
+        if op == Op.PREFLIGHT:
+            # Answered here and not by the caller: macOS decides per responsible
+            # process, and that is the broker's, not the asking terminal's.
+            from . import preflight
+            return preflight.report(request=req.get("request") is True)
         if op == Op.SUBMIT:
             if not isinstance(req.get("job"), dict):
                 return _bad("submit needs a job object")

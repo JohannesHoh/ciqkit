@@ -32,6 +32,9 @@ def private_runtime_dir(tmp_path_factory, monkeypatch):
     # storage dir is the developer's real simulator: point both at scratch so
     # no test journals, resets or pins anything real.
     monkeypatch.setenv("CIQKIT_STORAGE_JOURNAL", str(base / "storage-journal"))
+    # A developer's real ciqkit.app must not start brokers for the tests.
+    monkeypatch.setenv("CIQKIT_APP_DIR", str(base / "apps"))
+    monkeypatch.delenv("CIQKIT_APP", raising=False)
     monkeypatch.setenv("CIQKIT_SIM_APPS_DIR", str(base / "sim-apps"))
 
 

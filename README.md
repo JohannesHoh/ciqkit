@@ -91,6 +91,7 @@ tool is the better pick:
   `/usr/bin/osascript`. Without it, window control silently fails and looks
   exactly like "the simulator did not start". `ciqkit doctor` tells you.
   The terminal also needs **Screen Recording**, because captures are screen grabs.
+  `ciqkit mac-app install` lists ciqkit itself there instead ([install guide](docs/install.md)).
 * **Windows:** Java on `PATH` (the SDK's own tools need it), and
   [Git for Windows](https://git-scm.com/download/win) if your build command is
   a shell script (such as a project's `scripts/build.sh`). ciqkit runs it with

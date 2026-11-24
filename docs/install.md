@@ -56,6 +56,27 @@ window lookup returns nothing, and the symptom is a misleading
 Then fully quit and reopen that app — a running process does not pick up a new
 grant.
 
+### Or: list ciqkit under its own name
+
+The grant above goes to whatever started ciqkit, and covers everything else that
+program runs. Started by a background service, that is `node` or `Python`, and
+it can change with every restart. To have macOS list **ciqkit** instead:
+
+```bash
+ciqkit mac-app install    # builds ~/Applications/ciqkit.app (needs clang)
+ciqkit mac-app request    # macOS lists it; switch it on in System Settings
+ciqkit mac-app status
+```
+
+Switch on `ciqkit` under **Accessibility** and **Screen & System Audio Recording**
+(macOS also asks once whether it may control System Events), then run
+`ciqkit sim shutdown` so the next job starts a broker with the new permission. The
+broker runs through the app from then on; `ciqkit mac-app uninstall` undoes it.
+
+The app runs one fixed interpreter and module and is not a sandbox: anything
+that runs as you and can edit ciqkit's files can still use its permission.
+Rebuilding it (another interpreter, `--force`) makes macOS ask again.
+
 ## 3. Windows
 
 No permission prompt is involved. What is needed:

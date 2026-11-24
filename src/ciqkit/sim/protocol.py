@@ -474,7 +474,8 @@ class Op:
     STATUS = "status"      # {op}                            -> {ok, jobs:[...], current}
     BUMP = "bump"          # {op, job_id, priority}          -> {ok}
     CANCEL = "cancel"      # {op, job_id}                    -> {ok}
-    PING = "ping"          # {op}                            -> {ok, pid, uptime_s, version, install}
+    PING = "ping"          # {op} -> {ok, pid, uptime_s, version, install, as_app}
+    PREFLIGHT = "preflight"  # {op, request?} -> {ok, passed, as_app, error?, ...}
     SHUTDOWN = "shutdown"  # {op}                            -> {ok}  (admin/tests)
 
 
