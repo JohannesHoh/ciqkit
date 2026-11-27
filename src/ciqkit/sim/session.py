@@ -908,10 +908,12 @@ class SimSession:
             pass
         log.warning("button %r on %s: could not align the capture with the device "
                     "art. scale hint %s, geometry %s, capture %s, capture dark bbox %s, "
-                    "device dark bbox %s, tried %s, best %s. Files: %s",
+                    "device dark bbox %s, tried %s, best %s. Files in %s: %s",
                     button, self._device_id(), scale, geom, info.get("capture_size"),
                     info.get("capture_dark_bbox"), info.get("device_dark_bbox"),
-                    info.get("tried"), info.get("best"), info.get("files"))
+                    info.get("tried"), info.get("best"), od, info.get("files"))
+        # od is logged on its own, not only inside the files repr: on Windows a
+        # repr doubles every backslash, and the reader copies this path.
         return od
 
     def _do_input(self, kind, x, y, direction, key, delay, hold=None, swipe=None):
