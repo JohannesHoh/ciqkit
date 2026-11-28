@@ -1,0 +1,16 @@
+{
+  "name": "ciqkit",
+  "owner": { "name": "JohannesHoh" },
+  "metadata": {
+    "description": "Unofficial tooling for Garmin Connect IQ watch apps: verified simulator screenshots, navigation and unit tests for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "ciqkit",
+      "source": "./plugin",
+      "description": "Let a coding agent test its own Connect IQ watch app in the simulator: verified loads, screenshots, gestures, unit tests and round-bezel checks.",
+      "category": "development",
+      "keywords": ["garmin", "connect-iq", "monkey-c", "simulator", "testing", "mcp"]
+    }
+  ]
+}

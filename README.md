@@ -207,6 +207,20 @@ precedence), or avoid it entirely by always passing `--prg`. See
 { "mcpServers": { "ciqsim": { "command": "ciqkit-mcp" } } }
 ```
 
+In Claude Code, the plugin adds that server plus a skill that teaches the agent
+the loop (test, shoot, look, check layout) and how to read the results:
+
+```
+/plugin install ciqkit --marketplace JohannesHoh/ciqkit
+```
+
+(Older Claude Code: `/plugin marketplace add JohannesHoh/ciqkit`, then
+`/plugin install ciqkit@ciqkit`.)
+
+It needs ciqkit itself installed (above). The skill is a plain
+[`SKILL.md`](plugin/skills/ciqkit/SKILL.md), so other agents that read skills
+can use it too.
+
 Read [SECURITY.md](SECURITY.md#3-the-mcp-server-inherits-both-of-the-above)
 first: an MCP client with these tools can build any project it names.
 

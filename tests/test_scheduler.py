@@ -1416,7 +1416,11 @@ class _BudgetSession(FakeSession):
 
     def build(self, *a, **k):
         self.timeouts.append(("build", k["timeout_s"]))
+        t0 = time.monotonic()
         time.sleep(self.build_s)
+        # What the broker's monotonic clock saw, not the nominal sleep: on
+        # Windows a 0.3 s sleep can read as 0.297 s at ~16 ms clock ticks.
+        self.slept_s = time.monotonic() - t0
         return "fake.prg"
 
     def run_tests(self, prg, device="venu3", timeout_s=300):
@@ -1449,8 +1453,8 @@ def test_a_test_batch_shares_one_budget_between_build_and_tests(tmp_path):
     # The tests get what the build LEFT, not max_s afresh: the time the build
     # really took plus the tests' budget stays inside the chunk, with the margin
     # to spare for the worker join.
-    assert fake.build_s + tests_t <= tb.max_s - broker_mod.BUDGET_MARGIN_S + 1e-6
-    assert tests_t < tb.max_s - fake.build_s
+    assert fake.slept_s + tests_t <= tb.max_s - broker_mod.BUDGET_MARGIN_S + 1e-6
+    assert tests_t < tb.max_s - fake.slept_s
 
 
 class _KwargSession(FakeSession):

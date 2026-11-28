@@ -1,0 +1,10 @@
+{
+  "name": "ciqkit",
+  "description": "Let a coding agent test its own Garmin Connect IQ watch app in the simulator: verified loads, screenshots, gestures, unit tests and round-bezel checks. Unofficial; not affiliated with Garmin.",
+  "version": "0.1.0",
+  "author": { "name": "JohannesHoh" },
+  "homepage": "https://github.com/JohannesHoh/ciqkit",
+  "repository": "https://github.com/JohannesHoh/ciqkit",
+  "license": "Apache-2.0",
+  "keywords": ["garmin", "connect-iq", "monkey-c", "simulator", "testing", "mcp"]
+}

@@ -237,7 +237,7 @@ def _broker_job(monkeypatch, level):
 
     from ciqkit.sim import broker as bm
     from ciqkit.sim.protocol import Chunk, ChunkKind, Job, JobState, Op
-    from tests.test_scheduler import FakeSession  # noqa: F401
+    from test_scheduler import FakeSession  # noqa: F401
     calls = []
     monkeypatch.setattr(preflight, "memory_pressure", lambda: calls.append(1) or level)
     b = bm.Broker(session=FakeSession())

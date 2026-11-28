@@ -18,6 +18,10 @@ has, install from a clone (`pip install -e ".[sim]"`).
 
 ### Added
 
+* A Claude Code plugin (`plugin/`, listed by `.claude-plugin/marketplace.json`):
+  the `ciqsim` MCP server plus a `ciqkit` skill that teaches an agent the
+  test–shoot–look–layout loop and how to read verdicts and exit codes.
+  `/plugin install ciqkit --marketplace JohannesHoh/ciqkit`.
 * macOS: `ciqkit mac-app install` builds a small background app the broker runs
   through, so macOS lists `ciqkit` itself under Accessibility and Screen
   Recording instead of the terminal, `node` or `Python` that happened to start
